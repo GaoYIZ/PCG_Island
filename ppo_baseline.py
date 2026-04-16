@@ -114,9 +114,15 @@ class PPOAgent:
         self.network = PPONetwork(state_dim, action_dim, hidden_dim, action_range)
         self.optimizer = optim.Adam(self.network.parameters(), lr=learning_rate)
     
+    def to(self, device):
+        """将模型移动到指定设备"""
+        self.network = self.network.to(device)
+        return self
+    
     def select_action(self, state, deterministic=False):
         """选择动作"""
-        state = torch.FloatTensor(state).unsqueeze(0)
+        device = self.network.actor.parameters().__next__().device
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
         
         with torch.no_grad():
             if deterministic:
@@ -125,7 +131,7 @@ class PPOAgent:
             else:
                 action, _ = self.network.sample_action(state)
         
-        return action.detach().numpy()[0]
+        return action.detach().cpu().numpy()[0]
     
     def compute_gae(self, rewards, values, dones, next_value):
         """计算Generalized Advantage Estimation"""

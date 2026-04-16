@@ -161,9 +161,17 @@ class SACAgent:
         self.log_alpha = torch.zeros(1, requires_grad=True)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=learning_rate)
     
+    def to(self, device):
+        """将模型移动到指定设备"""
+        self.q_network = self.q_network.to(device)
+        self.q_target = self.q_target.to(device)
+        self.policy = self.policy.to(device)
+        self.log_alpha = self.log_alpha.to(device)
+        return self
+    
     def select_action(self, state, evaluate=False):
         """选择动作"""
-        state = torch.FloatTensor(state).unsqueeze(0)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.q_network.parameters().__next__().device)
         
         if evaluate:
             # 评估时使用确定性策略
@@ -173,7 +181,7 @@ class SACAgent:
             # 训练时采样
             action, _ = self.policy.sample(state)
         
-        return action.detach().numpy()[0]
+        return action.detach().cpu().numpy()[0]
     
     def update(self, replay_buffer, batch_size=64):
         """更新网络参数"""
@@ -183,11 +191,14 @@ class SACAgent:
         # 采样
         states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
         
-        states = torch.FloatTensor(states)
-        actions = torch.FloatTensor(actions)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1)
-        next_states = torch.FloatTensor(next_states)
-        dones = torch.FloatTensor(dones).unsqueeze(1)
+        # 获取设备
+        device = self.q_network.parameters().__next__().device
+        
+        states = torch.FloatTensor(states).to(device)
+        actions = torch.FloatTensor(actions).to(device)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
+        next_states = torch.FloatTensor(next_states).to(device)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
         
         # 更新Q网络
         q_loss = self._update_q(states, actions, rewards, next_states, dones)
