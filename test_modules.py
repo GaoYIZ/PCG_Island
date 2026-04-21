@@ -15,6 +15,7 @@ from dataset_pipeline import IslandDatasetBuilder
 from feature_processing import IslandFeatureNormalizer, ParameterSpaceNormalizer
 from map_scoring import MapScorer
 from pcg_generator import PCGIslandGenerator
+from ppo_baseline import PPOAgent
 from rl_environment import IslandGenerationEnv
 from structure_evaluator import StructureEvaluator
 from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
@@ -143,6 +144,33 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertTrue(np.all(best_params <= 1.0 + 1e-6))
         self.assertTrue(np.all(best_params >= -1.0 - 1e-6))
         self.assertGreaterEqual(best_fitness, 0.0)
+
+    def test_ppo_agent_can_collect_and_update(self) -> None:
+        env = IslandGenerationEnv(map_size=64, max_steps=6)
+        agent = PPOAgent(
+            state_dim=env.observation_space.shape[0],
+            action_dim=env.action_space.shape[0],
+            hidden_dim=64,
+            batch_size=4,
+            epoch=2,
+            action_range=1.0,
+        ).to("cpu")
+
+        memory = []
+        state, _ = env.reset(seed=123)
+        for _ in range(8):
+            action, log_prob = agent.get_action_and_log_prob(state, deterministic=False)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            memory.append((state, action, reward, next_state, done, log_prob))
+            state = next_state
+            if done:
+                state, _ = env.reset()
+
+        losses = agent.update(memory)
+        self.assertIn("total_loss", losses)
+        self.assertIn("policy_loss", losses)
+        self.assertIn("value_loss", losses)
 
 
 if __name__ == "__main__":
