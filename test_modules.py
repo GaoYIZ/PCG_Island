@@ -143,11 +143,21 @@ class IslandPipelineTests(unittest.TestCase):
         )
         dataset = HeightmapDataset(heightmaps)
         dataloader = DataLoader(dataset, batch_size=5, shuffle=False)
-        vae = BetaVAE(map_size=64, latent_dim=8, beta=2.0)
-        history = train_vae(vae, dataloader, epochs=1, device="cpu")
+        vae = BetaVAE(
+            map_size=64,
+            latent_dim=8,
+            beta=0.25,
+            beta_start=0.0,
+            free_bits=0.01,
+            gradient_loss_weight=0.20,
+        )
+        history = train_vae(vae, dataloader, epochs=1, device="cpu", warmup_epochs=1)
         latents = encode_heightmaps(vae, heightmaps, batch_size=5, device="cpu")
 
         self.assertEqual(len(history), 1)
+        self.assertIn("beta", history[0])
+        self.assertIn("gradient_loss", history[0])
+        self.assertIn("kl_raw", history[0])
         self.assertEqual(latents.shape, (10, 8))
 
     def test_cmaes_baseline_runs_in_normalized_space(self) -> None:

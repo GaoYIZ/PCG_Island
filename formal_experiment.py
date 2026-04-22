@@ -51,9 +51,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sampling-profile", type=str, default="island", choices=["uniform", "island"], help="参数采样策略")
     parser.add_argument("--batch-size", type=int, default=32, help="VAE 和 PPO 的批大小")
     parser.add_argument("--latent-dim", type=int, default=16, help="VAE latent 维度")
-    parser.add_argument("--vae-epochs", type=int, default=20, help="VAE 训练轮数")
-    parser.add_argument("--vae-beta", type=float, default=2.0, help="Beta-VAE 的 beta")
-    parser.add_argument("--vae-lr", type=float, default=1e-3, help="VAE 学习率")
+    parser.add_argument("--vae-epochs", type=int, default=30, help="VAE 训练轮数")
+    parser.add_argument("--vae-beta", type=float, default=0.25, help="Beta-VAE 的 beta")
+    parser.add_argument("--vae-beta-start", type=float, default=0.0, help="KL warmup 起始 beta")
+    parser.add_argument("--vae-warmup-epochs", type=int, default=12, help="KL warmup 轮数")
+    parser.add_argument("--vae-free-bits", type=float, default=0.01, help="每个 latent 维度的最小 KL")
+    parser.add_argument("--vae-gradient-loss-weight", type=float, default=0.20, help="边界/梯度重建损失权重")
+    parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE 学习率")
     parser.add_argument("--ppo-episodes", type=int, default=60, help="PPO 训练轮数")
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="PPO 单轮最大步数")
     parser.add_argument("--ppo-hidden-dim", type=int, default=256, help="PPO 隐层维度")
@@ -286,10 +290,17 @@ def train_formal_vae(
     device: torch.device,
 ) -> Tuple[BetaVAE, np.ndarray, List[dict]]:
     print_section("第二阶段：VAE 训练与隐向量提取")
-    dataset = HeightmapDataset(arrays["heightmaps"])
+    dataset = HeightmapDataset(arrays["heightmaps"], augment=True)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    vae = BetaVAE(map_size=args.map_size, latent_dim=args.latent_dim, beta=args.vae_beta).to(device)
+    vae = BetaVAE(
+        map_size=args.map_size,
+        latent_dim=args.latent_dim,
+        beta=args.vae_beta,
+        beta_start=args.vae_beta_start,
+        free_bits=args.vae_free_bits,
+        gradient_loss_weight=args.vae_gradient_loss_weight,
+    ).to(device)
     start_time = time.time()
     history = train_vae(
         vae,
@@ -297,6 +308,7 @@ def train_formal_vae(
         epochs=args.vae_epochs,
         learning_rate=args.vae_lr,
         device=str(device),
+        warmup_epochs=args.vae_warmup_epochs,
     )
     duration = time.time() - start_time
     print(f"VAE 训练完成，用时 {duration / 60:.2f} 分钟")
@@ -325,6 +337,14 @@ def train_formal_vae(
             "latent_shape": list(latents.shape),
             "latent_mean": float(latents.mean()),
             "latent_std": float(latents.std()),
+            "vae_config": {
+                "beta": args.vae_beta,
+                "beta_start": args.vae_beta_start,
+                "warmup_epochs": args.vae_warmup_epochs,
+                "free_bits": args.vae_free_bits,
+                "gradient_loss_weight": args.vae_gradient_loss_weight,
+                "learning_rate": args.vae_lr,
+            },
             "vae_history": history,
         },
         output_dir / "vae_summary.json",
@@ -369,7 +389,8 @@ def evaluate_vae_representation(
             metric_corr[name] = float(np.corrcoef(origin, recon)[0, 1])
 
     latent_std_per_dim = latents.std(axis=0) if len(latents) > 0 else np.zeros((args.latent_dim,), dtype=np.float32)
-    active_dim_threshold = 0.01
+    latent_global_std = float(latents.std()) if len(latents) > 0 else 0.0
+    active_dim_threshold = max(1e-3, latent_global_std * 0.02)
     active_dims = int(np.sum(latent_std_per_dim > active_dim_threshold))
 
     predictive_r2 = {}
@@ -413,7 +434,7 @@ def evaluate_vae_representation(
         "metric_reconstruction_mae": metric_mae,
         "metric_reconstruction_correlation": metric_corr,
         "latent_global_mean": float(latents.mean()) if len(latents) > 0 else 0.0,
-        "latent_global_std": float(latents.std()) if len(latents) > 0 else 0.0,
+        "latent_global_std": latent_global_std,
         "active_latent_threshold": active_dim_threshold,
         "active_latent_dims": active_dims,
         "latent_std_per_dim": {f"z{idx:02d}": float(value) for idx, value in enumerate(latent_std_per_dim)},
