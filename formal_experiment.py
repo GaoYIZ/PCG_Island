@@ -21,6 +21,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib import font_manager
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import KFold, cross_val_score
@@ -30,6 +31,7 @@ from dataset_pipeline import IslandDatasetBuilder
 from feature_processing import IslandFeatureNormalizer
 from ppo_baseline import PPOAgent
 from reporting import (
+    metric_label,
     print_dataset_summary,
     print_metric_dict,
     print_section,
@@ -39,6 +41,9 @@ from reporting import (
 from rl_environment import IslandGenerationEnv
 from sac_agent import ReplayBuffer, SACAgent
 from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
+
+
+COAST_THRESHOLD = 0.30
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-warmup-epochs", type=int, default=12, help="KL warmup 轮数")
     parser.add_argument("--vae-free-bits", type=float, default=0.01, help="每个 latent 维度的最小 KL")
     parser.add_argument("--vae-gradient-loss-weight", type=float, default=0.20, help="边界/梯度重建损失权重")
+    parser.add_argument("--vae-mask-loss-weight", type=float, default=0.15, help="陆地掩码重建损失权重")
+    parser.add_argument("--vae-coast-loss-weight", type=float, default=0.20, help="海岸线重建损失权重")
     parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE 学习率")
     parser.add_argument("--ppo-episodes", type=int, default=60, help="PPO 训练轮数")
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="PPO 单轮最大步数")
@@ -74,15 +81,50 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def configure_matplotlib_chinese() -> None:
+    candidate_fonts = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "WenQuanYi Zen Hei",
+        "Arial Unicode MS",
+    ]
+    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    selected = [font for font in candidate_fonts if font in available_fonts]
+    if selected:
+        plt.rcParams["font.sans-serif"] = selected + ["DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+def draw_heightmap_with_coast(
+    axis,
+    heightmap: np.ndarray,
+    title: str,
+    coast_threshold: float = COAST_THRESHOLD,
+) -> None:
+    axis.imshow(heightmap, cmap="terrain")
+    coast_mask = np.asarray(heightmap, dtype=np.float32)
+    axis.contour(
+        coast_mask,
+        levels=[coast_threshold],
+        colors=["white"],
+        linewidths=1.0,
+        alpha=0.95,
+    )
+    axis.set_title(title)
+    axis.axis("off")
+
+
 def plot_curve(values: Sequence[float], title: str, ylabel: str, output_path: Path) -> None:
     plt.figure(figsize=(10, 5))
     plt.plot(values, linewidth=2, alpha=0.85)
     if len(values) >= 10:
         moving_average = np.convolve(values, np.ones(10) / 10, mode="valid")
-        plt.plot(range(9, len(values)), moving_average, linewidth=2, color="red", label="MA(10)")
+        plt.plot(range(9, len(values)), moving_average, linewidth=2, color="red", label="10轮滑动均值")
         plt.legend()
     plt.title(title)
-    plt.xlabel("Episode")
+    plt.xlabel("轮次")
     plt.ylabel(ylabel)
     plt.grid(True, alpha=0.3)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,10 +140,8 @@ def plot_dataset_samples(heightmaps: np.ndarray, output_path: Path, num_samples:
     rows = int(np.ceil(num_samples / cols))
     plt.figure(figsize=(12, 4 * rows))
     for idx in range(num_samples):
-        plt.subplot(rows, cols, idx + 1)
-        plt.imshow(heightmaps[idx], cmap="terrain")
-        plt.title(f"Sample {idx + 1}")
-        plt.axis("off")
+        axis = plt.subplot(rows, cols, idx + 1)
+        draw_heightmap_with_coast(axis, heightmaps[idx], f"样本 {idx + 1}")
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -115,12 +155,8 @@ def plot_reconstruction(originals: np.ndarray, reconstructions: np.ndarray, outp
     fig, axes = plt.subplots(2, num_samples, figsize=(3 * num_samples, 6))
     axes = np.asarray(axes).reshape(2, num_samples)
     for idx in range(num_samples):
-        axes[0, idx].imshow(originals[idx], cmap="terrain")
-        axes[0, idx].set_title(f"Original {idx + 1}")
-        axes[0, idx].axis("off")
-        axes[1, idx].imshow(reconstructions[idx], cmap="terrain")
-        axes[1, idx].set_title(f"Recon {idx + 1}")
-        axes[1, idx].axis("off")
+        draw_heightmap_with_coast(axes[0, idx], originals[idx], f"原图 {idx + 1}")
+        draw_heightmap_with_coast(axes[1, idx], reconstructions[idx], f"重建 {idx + 1}")
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -134,7 +170,8 @@ def plot_metric_bars(metric_values: Dict[str, float], title: str, ylabel: str, o
     values = [metric_values[name] for name in names]
 
     plt.figure(figsize=(10, 5))
-    plt.bar(names, values, color="#4C78A8")
+    display_names = [metric_label(name) for name in names]
+    plt.bar(display_names, values, color="#4C78A8")
     plt.title(title)
     plt.ylabel(ylabel)
     plt.xticks(rotation=30, ha="right")
@@ -161,13 +198,13 @@ def plot_latent_projection(
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     scatter_1 = axes[0].scatter(points[:, 0], points[:, 1], c=score_values, cmap="viridis", s=36)
-    axes[0].set_title("Latent PCA colored by total score")
+    axes[0].set_title("隐空间 PCA（按总评分着色）")
     axes[0].set_xlabel("PC1")
     axes[0].set_ylabel("PC2")
     fig.colorbar(scatter_1, ax=axes[0], fraction=0.046, pad=0.04)
 
     scatter_2 = axes[1].scatter(points[:, 0], points[:, 1], c=land_values, cmap="plasma", s=36)
-    axes[1].set_title("Latent PCA colored by land ratio")
+    axes[1].set_title("隐空间 PCA（按陆地占比着色）")
     axes[1].set_xlabel("PC1")
     axes[1].set_ylabel("PC2")
     fig.colorbar(scatter_2, ax=axes[1], fraction=0.046, pad=0.04)
@@ -195,13 +232,9 @@ def plot_ranked_maps(
     fig, axes = plt.subplots(2, num_samples, figsize=(3.2 * num_samples, 6))
     axes = np.asarray(axes).reshape(2, num_samples)
     for col, idx in enumerate(top_indices):
-        axes[0, col].imshow(heightmaps[idx], cmap="terrain")
-        axes[0, col].set_title(f"Top {col + 1}\n{scores[idx]:.3f}")
-        axes[0, col].axis("off")
+        draw_heightmap_with_coast(axes[0, col], heightmaps[idx], f"高分 {col + 1}\n{scores[idx]:.3f}")
     for col, idx in enumerate(bottom_indices):
-        axes[1, col].imshow(heightmaps[idx], cmap="terrain")
-        axes[1, col].set_title(f"Bottom {col + 1}\n{scores[idx]:.3f}")
-        axes[1, col].axis("off")
+        draw_heightmap_with_coast(axes[1, col], heightmaps[idx], f"低分 {col + 1}\n{scores[idx]:.3f}")
 
     fig.suptitle(title_prefix)
     plt.tight_layout()
@@ -275,7 +308,7 @@ def build_dataset(
         [sample.heightmap for sample in clean_samples],
         [sample.score for sample in clean_samples],
         output_dir / "dataset_score_extremes.png",
-        title_prefix="Clean dataset score extremes",
+        title_prefix="清洗后数据集评分极值样本",
     )
 
     save_json(raw_summary, output_dir / "dataset_summary_raw.json")
@@ -300,6 +333,8 @@ def train_formal_vae(
         beta_start=args.vae_beta_start,
         free_bits=args.vae_free_bits,
         gradient_loss_weight=args.vae_gradient_loss_weight,
+        mask_loss_weight=args.vae_mask_loss_weight,
+        coast_loss_weight=args.vae_coast_loss_weight,
     ).to(device)
     start_time = time.time()
     history = train_vae(
@@ -320,8 +355,8 @@ def train_formal_vae(
 
     plot_curve(
         [entry["total_loss"] for entry in history],
-        title="VAE Training Loss",
-        ylabel="Loss",
+        title="VAE 训练损失曲线",
+        ylabel="损失值",
         output_path=output_dir / "vae_training_curve.png",
     )
 
@@ -343,6 +378,8 @@ def train_formal_vae(
                 "warmup_epochs": args.vae_warmup_epochs,
                 "free_bits": args.vae_free_bits,
                 "gradient_loss_weight": args.vae_gradient_loss_weight,
+                "mask_loss_weight": args.vae_mask_loss_weight,
+                "coast_loss_weight": args.vae_coast_loss_weight,
                 "learning_rate": args.vae_lr,
             },
             "vae_history": history,
@@ -414,11 +451,11 @@ def evaluate_vae_representation(
         predictive_r2 = {name: 0.0 for name in builder.evaluator.metric_names}
 
     land_index = builder.evaluator.metric_names.index("land_ratio")
-    plot_metric_bars(metric_mae, "VAE metric reconstruction MAE", "MAE", output_dir / "vae_metric_mae.png")
+    plot_metric_bars(metric_mae, "VAE 结构指标重建误差", "平均绝对误差", output_dir / "vae_metric_mae.png")
     plot_metric_bars(
         predictive_r2,
-        "Latent predictiveness on structural metrics",
-        "R2",
+        "隐向量对结构指标的预测能力",
+        "R²",
         output_dir / "vae_latent_predictiveness.png",
     )
     plot_latent_projection(
@@ -529,8 +566,8 @@ def train_ppo(
 
     plot_curve(
         episode_rewards,
-        title="PPO Training Reward",
-        ylabel="Reward",
+        title="PPO 训练奖励曲线",
+        ylabel="奖励值",
         output_path=output_dir / "ppo_training_curve.png",
     )
     torch.save(agent.network.state_dict(), output_dir / "ppo_agent.pth")
@@ -588,8 +625,8 @@ def train_sac(
 
     plot_curve(
         episode_rewards,
-        title="SAC Training Reward",
-        ylabel="Reward",
+        title="SAC 训练奖励曲线",
+        ylabel="奖励值",
         output_path=output_dir / "sac_training_curve.png",
     )
     agent.save(output_dir / "sac_agent.pth")
@@ -683,7 +720,7 @@ def evaluate_agent(
         heightmaps,
         total_scores,
         output_dir / f"{name.lower()}_score_extremes.png",
-        title_prefix=f"{name} score extremes",
+        title_prefix=f"{name} 评分极值样本",
     )
 
     save_json(summary, output_dir / f"{name.lower()}_evaluation_summary.json")
@@ -713,6 +750,7 @@ def compare_policy_summaries(policy_summaries: Dict[str, Dict[str, object]]) -> 
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    configure_matplotlib_chinese()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

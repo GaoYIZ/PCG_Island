@@ -30,8 +30,23 @@ METRIC_LABELS_ZH: Dict[str, str] = {
 }
 
 
+REJECTION_LABELS_ZH: Dict[str, str] = {
+    "too_little_land": "陆地面积过小",
+    "too_much_land": "陆地面积过大",
+    "poor_reachability": "路径可达性不足",
+    "weak_connectivity": "连通性较弱",
+    "too_flat": "地形过于平坦",
+    "low_quality_score": "综合质量分过低",
+    "near_duplicate_metrics": "结构指标近似重复",
+}
+
+
 def metric_label(name: str) -> str:
     return METRIC_LABELS_ZH.get(name, name)
+
+
+def rejection_label(name: str) -> str:
+    return REJECTION_LABELS_ZH.get(name, name)
 
 
 def print_section(title: str) -> None:
@@ -58,6 +73,8 @@ def print_distribution_summary(metric_matrix: np.ndarray, metric_names: Sequence
 def print_dataset_summary(summary: Mapping[str, object]) -> None:
     print(f"原始样本数          : {summary['num_samples']}")
     print(f"有效样本数          : {summary['num_valid']}")
+    if "valid_ratio" in summary:
+        print(f"有效率             : {summary['valid_ratio']:.4f}")
     print(f"平均质量分          : {summary['quality_score_mean']:.4f}")
     print(f"质量分标准差        : {summary['quality_score_std']:.4f}")
 
@@ -75,7 +92,7 @@ def print_dataset_summary(summary: Mapping[str, object]) -> None:
     if rejection_histogram:
         print("\n被过滤原因统计:")
         for key, value in rejection_histogram.items():
-            print(f"{key:<20}: {value}")
+            print(f"{rejection_label(key):<18}: {value}")
 
 
 def save_json(data: Mapping[str, object], path: str | Path) -> None:

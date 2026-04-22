@@ -157,6 +157,8 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertIn("beta", history[0])
         self.assertIn("gradient_loss", history[0])
+        self.assertIn("mask_loss", history[0])
+        self.assertIn("coast_loss", history[0])
         self.assertIn("kl_raw", history[0])
         self.assertEqual(latents.shape, (10, 8))
 
