@@ -30,6 +30,7 @@ class IslandGenerationEnv(gym.Env):
         scorer: Optional[MapScorer] = None,
         include_latent: bool = True,
         action_step_scale: float = 0.15,
+        sampling_profile: str = "island",
     ):
         super().__init__()
 
@@ -41,6 +42,7 @@ class IslandGenerationEnv(gym.Env):
         self.generator = PCGIslandGenerator(map_size=map_size)
         self.evaluator = StructureEvaluator(map_size=map_size)
         self.scorer = scorer or MapScorer()
+        self.sampling_profile = sampling_profile
 
         self.param_ranges = self.generator.get_param_ranges(map_size)
         self.param_normalizer = ParameterSpaceNormalizer(
@@ -84,7 +86,7 @@ class IslandGenerationEnv(gym.Env):
     ) -> Tuple[np.ndarray, dict]:
         super().reset(seed=seed)
 
-        self.current_params = self.generator.sample_random_params(self.np_random)
+        self.current_params = self.generator.sample_random_params(self.np_random, profile=self.sampling_profile)
         self.current_seed = int(self.current_params["seed"])
         self.current_heightmap = self.generator.generate_heightmap(self.current_params)
         self.current_metrics = self.evaluator.evaluate(self.current_heightmap)

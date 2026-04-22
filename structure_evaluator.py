@@ -111,9 +111,6 @@ class StructureEvaluator:
 
         while queue:
             y, x = queue.popleft()
-            if self._is_boundary(y, x) and navigable_mask[y, x]:
-                return 1.0
-
             for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 ny, nx = y + dy, x + dx
                 if 0 <= ny < self.map_size and 0 <= nx < self.map_size:
@@ -121,7 +118,7 @@ class StructureEvaluator:
                         visited[ny, nx] = True
                         queue.append((ny, nx))
 
-        return 0.0
+        return float(np.sum(visited) / max(float(np.sum(navigable_mask)), 1.0))
 
     @staticmethod
     def _calculate_land_ratio(land_mask: np.ndarray) -> float:

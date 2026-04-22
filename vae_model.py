@@ -92,7 +92,9 @@ class BetaVAE(nn.Module):
 
     def encode_heightmap(self, heightmap: np.ndarray, device: str = "cpu", deterministic: bool = True) -> np.ndarray:
         self.eval()
-        tensor = torch.as_tensor(heightmap, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+        model_device = next(self.parameters()).device
+        target_device = model_device if device == "cpu" else torch.device(device)
+        tensor = torch.as_tensor(heightmap, dtype=torch.float32, device=target_device).unsqueeze(0).unsqueeze(0)
         with torch.no_grad():
             mu, logvar = self.encode(tensor)
             latent = mu if deterministic else self.reparameterize(mu, logvar)

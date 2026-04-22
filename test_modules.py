@@ -115,6 +115,24 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertLessEqual(score.total_score, 1.0)
         self.assertIn("variance_score", score.component_scores)
 
+    def test_scorer_directly_penalizes_oversized_maps(self) -> None:
+        balanced_metrics = {
+            "connectivity": 1.0,
+            "navigable_ratio": 0.95,
+            "coast_complexity": 4.5,
+            "terrain_variance": 0.14,
+            "path_reachability": 1.0,
+            "land_ratio": 0.32,
+        }
+        oversized_metrics = dict(balanced_metrics)
+        oversized_metrics["land_ratio"] = 0.82
+
+        balanced_score = self.scorer.score_metrics(balanced_metrics)
+        oversized_score = self.scorer.score_metrics(oversized_metrics)
+
+        self.assertGreater(balanced_score.land_score, oversized_score.land_score)
+        self.assertGreater(balanced_score.total_score, oversized_score.total_score)
+
     def test_vae_helpers_extract_latents(self) -> None:
         heightmaps = np.stack(
             [

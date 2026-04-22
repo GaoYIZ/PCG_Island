@@ -34,11 +34,13 @@ class IslandDatasetBuilder:
         self,
         map_size: int = 64,
         scorer: Optional[MapScorer] = None,
+        sampling_profile: str = "island",
     ):
         self.map_size = map_size
         self.generator = PCGIslandGenerator(map_size=map_size)
         self.evaluator = StructureEvaluator(map_size=map_size)
         self.scorer = scorer or MapScorer()
+        self.sampling_profile = sampling_profile
         self.param_ranges = self.generator.get_param_ranges(map_size)
         self.param_normalizer = ParameterSpaceNormalizer(self.param_ranges)
 
@@ -46,12 +48,14 @@ class IslandDatasetBuilder:
         self,
         n_samples: int,
         seed: int = 42,
+        sampling_profile: Optional[str] = None,
     ) -> List[DatasetSample]:
         rng = np.random.default_rng(seed)
         samples: List[DatasetSample] = []
+        profile = sampling_profile or self.sampling_profile
 
         for _ in range(n_samples):
-            params = self.generator.sample_random_params(rng)
+            params = self.generator.sample_random_params(rng, profile=profile)
             normalized_params = self.param_normalizer.normalize_params(params)
             heightmap = self.generator.generate_heightmap(params)
             metrics = self.evaluator.evaluate(heightmap)
@@ -87,7 +91,8 @@ class IslandDatasetBuilder:
             )
             if signature in seen_signatures:
                 sample.valid = False
-                sample.rejection_reasons.append("near_duplicate_metrics")
+                if "near_duplicate_metrics" not in sample.rejection_reasons:
+                    sample.rejection_reasons.append("near_duplicate_metrics")
                 continue
             if not sample.valid:
                 continue
@@ -98,6 +103,18 @@ class IslandDatasetBuilder:
         return cleaned
 
     def evaluate_dataset(self, samples: Sequence[DatasetSample]) -> Dict[str, object]:
+        if len(samples) == 0:
+            return {
+                "num_samples": 0,
+                "num_valid": 0,
+                "valid_ratio": 0.0,
+                "quality_score_mean": 0.0,
+                "quality_score_std": 0.0,
+                "metric_stats": {},
+                "param_stats": {},
+                "rejection_histogram": {},
+            }
+
         metrics_matrix = np.array(
             [[sample.metrics[name] for name in self.evaluator.metric_names] for sample in samples],
             dtype=np.float32,
@@ -119,17 +136,31 @@ class IslandDatasetBuilder:
             for reason in sample.rejection_reasons:
                 rejection_histogram[reason] = rejection_histogram.get(reason, 0) + 1
 
+        param_stats = {}
+        for name in self.param_normalizer.param_names:
+            values = np.array([float(sample.params[name]) for sample in samples], dtype=np.float32)
+            param_stats[name] = {
+                "mean": float(values.mean()),
+                "std": float(values.std()),
+                "min": float(values.min()),
+                "max": float(values.max()),
+            }
+
         return {
             "num_samples": len(samples),
             "num_valid": int(sum(sample.valid for sample in samples)),
+            "valid_ratio": float(sum(sample.valid for sample in samples) / max(len(samples), 1)),
             "quality_score_mean": float(scores.mean()),
             "quality_score_std": float(scores.std()),
             "metric_stats": metric_stats,
+            "param_stats": param_stats,
             "rejection_histogram": rejection_histogram,
         }
 
     def build_training_arrays(self, samples: Sequence[DatasetSample]) -> Dict[str, np.ndarray]:
         valid_samples = [sample for sample in samples if sample.valid]
+        if len(valid_samples) == 0:
+            raise ValueError("No valid dataset samples are available for training.")
         return {
             "heightmaps": np.stack([sample.heightmap for sample in valid_samples], axis=0),
             "normalized_params": np.stack([sample.normalized_params for sample in valid_samples], axis=0),
@@ -156,16 +187,16 @@ class IslandDatasetBuilder:
 
     def _collect_rejection_reasons(self, metrics: Dict[str, float], score: float) -> List[str]:
         reasons: List[str] = []
-        if metrics["land_ratio"] < 0.08:
+        if metrics["land_ratio"] < 0.10:
             reasons.append("too_little_land")
-        if metrics["land_ratio"] > 0.85:
+        if metrics["land_ratio"] > 0.60:
             reasons.append("too_much_land")
-        if metrics["connectivity"] < 0.75:
+        if metrics["connectivity"] < 0.90:
             reasons.append("weak_connectivity")
-        if metrics["path_reachability"] < 0.5:
+        if metrics["path_reachability"] < 0.80:
             reasons.append("poor_reachability")
-        if metrics["terrain_variance"] < 0.02:
+        if metrics["terrain_variance"] < 0.04:
             reasons.append("too_flat")
-        if score < 0.35:
+        if score < 0.45:
             reasons.append("low_quality_score")
         return reasons

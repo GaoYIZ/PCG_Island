@@ -43,23 +43,33 @@ class MapScorer:
 
     def __init__(
         self,
-        navigable_target: float = 0.65,
-        coast_target: float = 1.35,
-        variance_target: float = 0.15,
-        land_ratio_target: float = 0.32,
         novelty_scale: float = 0.35,
     ):
-        self.targets = {
-            "navigable_ratio": navigable_target,
-            "coast_complexity": coast_target,
-            "terrain_variance": variance_target,
-            "land_ratio": land_ratio_target,
-        }
-        self.sigmas = {
-            "navigable_ratio": 0.18,
-            "coast_complexity": 0.40,
-            "terrain_variance": 0.08,
-            "land_ratio": 0.15,
+        self.preferred_ranges = {
+            "navigable_ratio": {
+                "minimum": 0.70,
+                "ideal_low": 0.85,
+                "ideal_high": 1.00,
+                "maximum": 1.00,
+            },
+            "coast_complexity": {
+                "minimum": 1.20,
+                "ideal_low": 2.50,
+                "ideal_high": 6.50,
+                "maximum": 10.50,
+            },
+            "terrain_variance": {
+                "minimum": 0.03,
+                "ideal_low": 0.08,
+                "ideal_high": 0.18,
+                "maximum": 0.28,
+            },
+            "land_ratio": {
+                "minimum": 0.08,
+                "ideal_low": 0.18,
+                "ideal_high": 0.42,
+                "maximum": 0.62,
+            },
         }
         self.structure_weights = {
             "connectivity": 0.30,
@@ -69,15 +79,39 @@ class MapScorer:
         }
         self.total_weights = {
             "structure": 0.45,
-            "path": 0.25,
-            "land": 0.20,
+            "path": 0.20,
+            "land": 0.25,
             "novelty": 0.10,
         }
         self.novelty_scale = float(novelty_scale)
 
     @staticmethod
-    def _gaussian_score(value: float, target: float, sigma: float) -> float:
-        return float(np.exp(-((value - target) ** 2) / (2.0 * sigma**2)))
+    def _band_score(
+        value: float,
+        minimum: float,
+        ideal_low: float,
+        ideal_high: float,
+        maximum: float,
+    ) -> float:
+        if value < minimum or value > maximum:
+            return 0.0
+        if ideal_low <= value <= ideal_high:
+            return 1.0
+        if value < ideal_low:
+            if ideal_low <= minimum + 1e-8:
+                return 1.0
+            return float((value - minimum) / max(ideal_low - minimum, 1e-8))
+        if maximum <= ideal_high + 1e-8:
+            return 1.0
+        return float((maximum - value) / max(maximum - ideal_high, 1e-8))
+
+    def describe(self) -> Dict[str, object]:
+        return {
+            "preferred_ranges": self.preferred_ranges,
+            "structure_weights": self.structure_weights,
+            "total_weights": self.total_weights,
+            "novelty_scale": self.novelty_scale,
+        }
 
     def compute_novelty_score(
         self,
@@ -104,20 +138,17 @@ class MapScorer:
     ) -> ScoreBreakdown:
         structure_components = {
             "connectivity": float(np.clip(metrics["connectivity"], 0.0, 1.0)),
-            "navigable_ratio": self._gaussian_score(
+            "navigable_ratio": self._band_score(
                 metrics["navigable_ratio"],
-                self.targets["navigable_ratio"],
-                self.sigmas["navigable_ratio"],
+                **self.preferred_ranges["navigable_ratio"],
             ),
-            "coast_complexity": self._gaussian_score(
+            "coast_complexity": self._band_score(
                 metrics["coast_complexity"],
-                self.targets["coast_complexity"],
-                self.sigmas["coast_complexity"],
+                **self.preferred_ranges["coast_complexity"],
             ),
-            "terrain_variance": self._gaussian_score(
+            "terrain_variance": self._band_score(
                 metrics["terrain_variance"],
-                self.targets["terrain_variance"],
-                self.sigmas["terrain_variance"],
+                **self.preferred_ranges["terrain_variance"],
             ),
         }
 
@@ -126,10 +157,9 @@ class MapScorer:
             structure_score += weight * structure_components[name]
 
         path_score = float(np.clip(metrics["path_reachability"], 0.0, 1.0))
-        land_score = self._gaussian_score(
+        land_score = self._band_score(
             metrics["land_ratio"],
-            self.targets["land_ratio"],
-            self.sigmas["land_ratio"],
+            **self.preferred_ranges["land_ratio"],
         )
         novelty_score = self.compute_novelty_score(feature_vector, history_vectors)
 

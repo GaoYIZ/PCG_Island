@@ -77,10 +77,33 @@ class PCGIslandGenerator:
             "falloff_exponent": (1.0, 4.0),
         }
 
-    def sample_random_params(self, rng: Optional[np.random.Generator] = None) -> Dict[str, float]:
+    @classmethod
+    def get_sampling_ranges(cls, map_size: int, profile: str = "uniform") -> Dict[str, tuple[float, float]]:
+        base_ranges = cls.get_param_ranges(map_size)
+        if profile == "uniform":
+            return base_ranges
+        if profile == "island":
+            return {
+                "f": (6.0, 28.0),
+                "A": (0.70, 1.40),
+                "N_octaves": (3.0, 5.0),
+                "persistence": (0.35, 0.60),
+                "lacunarity": (1.60, 2.30),
+                "warp_strength": (0.05, 0.65),
+                "warp_frequency": (2.0, 7.5),
+                "falloff_radius": (map_size * 0.24, map_size * 0.48),
+                "falloff_exponent": (1.60, 3.20),
+            }
+        raise ValueError(f"Unsupported sampling profile: {profile}")
+
+    def sample_random_params(
+        self,
+        rng: Optional[np.random.Generator] = None,
+        profile: str = "uniform",
+    ) -> Dict[str, float]:
         rng = rng or np.random.default_rng()
         params = {}
-        for name, (low, high) in self.get_param_ranges(self.map_size).items():
+        for name, (low, high) in self.get_sampling_ranges(self.map_size, profile=profile).items():
             value = float(rng.uniform(low, high))
             if name == "N_octaves":
                 value = int(round(value))
@@ -113,11 +136,11 @@ class PCGIslandGenerator:
         )
         if warp_strength > 0.0:
             heightmap = self._domain_warping(heightmap, strength=warp_strength, frequency=warp_frequency)
-        heightmap = self._radial_falloff(heightmap, radius=falloff_radius, exponent=falloff_exponent)
         heightmap = self._normalize(heightmap)
 
-        # Scale around the midpoint so amplitude remains meaningful after normalization.
         heightmap = np.clip(0.5 + (heightmap - 0.5) * amplitude_scale, 0.0, 1.0)
+        heightmap = self._radial_falloff(heightmap, radius=falloff_radius, exponent=falloff_exponent)
+        heightmap = np.clip(heightmap, 0.0, 1.0)
         return heightmap.astype(np.float32)
 
     def _fbm(
