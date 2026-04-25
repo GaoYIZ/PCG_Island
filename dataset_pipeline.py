@@ -169,6 +169,10 @@ class IslandDatasetBuilder:
                 [[sample.metrics[name] for name in self.evaluator.metric_names] for sample in valid_samples],
                 dtype=np.float32,
             ),
+            "core_metric_matrix": np.array(
+                [[sample.metrics[name] for name in self.evaluator.core_metric_names] for sample in valid_samples],
+                dtype=np.float32,
+            ),
         }
 
     def fit_feature_normalizer(

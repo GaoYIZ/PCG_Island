@@ -192,7 +192,10 @@ class IslandPipelineTests(unittest.TestCase):
             axis=0,
         )
         structure_targets = np.array(
-            [[self.evaluator.evaluate(heightmap)[name] for name in self.evaluator.metric_names] for heightmap in heightmaps],
+            [
+                [self.evaluator.evaluate(heightmap)[name] for name in self.evaluator.core_metric_names]
+                for heightmap in heightmaps
+            ],
             dtype=np.float32,
         )
         dataset = HeightmapDataset(heightmaps, structure_targets=structure_targets)
@@ -215,6 +218,8 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertIn("gradient_loss", history[0])
         self.assertIn("mask_loss", history[0])
         self.assertIn("coast_loss", history[0])
+        self.assertIn("weighted_mse_loss", history[0])
+        self.assertIn("weighted_l1_loss", history[0])
         self.assertIn("structure_loss", history[0])
         self.assertIn("kl_raw", history[0])
         self.assertEqual(latents.shape, (10, 8))

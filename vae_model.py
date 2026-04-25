@@ -29,6 +29,8 @@ class BetaVAE(nn.Module):
         coast_loss_weight: float = 0.20,
         structure_dim: int = 0,
         structure_loss_weight: float = 0.0,
+        land_recon_focus_weight: float = 1.5,
+        coast_recon_focus_weight: float = 2.0,
     ):
         super().__init__()
         if map_size != 64:
@@ -46,6 +48,8 @@ class BetaVAE(nn.Module):
         self.coast_loss_weight = float(coast_loss_weight)
         self.structure_dim = int(structure_dim)
         self.structure_loss_weight = float(structure_loss_weight)
+        self.land_recon_focus_weight = float(land_recon_focus_weight)
+        self.coast_recon_focus_weight = float(coast_recon_focus_weight)
 
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=4, stride=2, padding=1),
@@ -134,6 +138,10 @@ class BetaVAE(nn.Module):
         grad_y = F.pad(grad_y.abs(), (0, 0, 0, 1))
         return torch.clamp(grad_x + grad_y, 0.0, 1.0)
 
+    @staticmethod
+    def _weighted_mean(loss_map: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        return torch.sum(loss_map * weights) / torch.sum(weights)
+
     def loss_function(
         self,
         reconstruction: torch.Tensor,
@@ -146,24 +154,30 @@ class BetaVAE(nn.Module):
         mse_loss = F.mse_loss(reconstruction, target, reduction="mean")
         l1_loss = F.l1_loss(reconstruction, target, reduction="mean")
 
+        target_land_mask = self._soft_land_mask(target)
+        target_coast = self._coast_response(target_land_mask)
+        pixel_weights = 1.0 + self.land_recon_focus_weight * target_land_mask + self.coast_recon_focus_weight * target_coast
+        weighted_mse_loss = self._weighted_mean((reconstruction - target).pow(2), pixel_weights)
+        weighted_l1_loss = self._weighted_mean((reconstruction - target).abs(), pixel_weights)
+
         recon_grad_x, recon_grad_y = self._gradient_map(reconstruction)
         target_grad_x, target_grad_y = self._gradient_map(target)
         gradient_loss = (
-            F.l1_loss(recon_grad_x, target_grad_x, reduction="mean")
-            + F.l1_loss(recon_grad_y, target_grad_y, reduction="mean")
+            self._weighted_mean((recon_grad_x - target_grad_x).abs(), pixel_weights[:, :, :, 1:])
+            + self._weighted_mean((recon_grad_y - target_grad_y).abs(), pixel_weights[:, :, 1:, :])
         )
 
         recon_land_mask = self._soft_land_mask(reconstruction)
-        target_land_mask = self._soft_land_mask(target)
         mask_loss = F.l1_loss(recon_land_mask, target_land_mask, reduction="mean")
 
         recon_coast = self._coast_response(recon_land_mask)
-        target_coast = self._coast_response(target_land_mask)
         coast_loss = F.l1_loss(recon_coast, target_coast, reduction="mean")
 
         recon_loss = (
-            0.70 * mse_loss
-            + 0.30 * l1_loss
+            0.35 * mse_loss
+            + 0.15 * l1_loss
+            + 0.35 * weighted_mse_loss
+            + 0.15 * weighted_l1_loss
             + self.gradient_loss_weight * gradient_loss
             + self.mask_loss_weight * mask_loss
             + self.coast_loss_weight * coast_loss
@@ -185,6 +199,8 @@ class BetaVAE(nn.Module):
             "recon_loss": recon_loss,
             "mse_loss": mse_loss,
             "l1_loss": l1_loss,
+            "weighted_mse_loss": weighted_mse_loss,
+            "weighted_l1_loss": weighted_l1_loss,
             "gradient_loss": gradient_loss,
             "mask_loss": mask_loss,
             "coast_loss": coast_loss,
@@ -260,6 +276,8 @@ def train_vae(
         gradient_loss = 0.0
         mask_loss = 0.0
         coast_loss = 0.0
+        weighted_mse_loss = 0.0
+        weighted_l1_loss = 0.0
         structure_loss = 0.0
         kl_loss = 0.0
         kl_raw = 0.0
@@ -290,6 +308,8 @@ def train_vae(
             recon_loss += float(losses["recon_loss"].item())
             mse_loss += float(losses["mse_loss"].item())
             l1_loss += float(losses["l1_loss"].item())
+            weighted_mse_loss += float(losses["weighted_mse_loss"].item())
+            weighted_l1_loss += float(losses["weighted_l1_loss"].item())
             gradient_loss += float(losses["gradient_loss"].item())
             mask_loss += float(losses["mask_loss"].item())
             coast_loss += float(losses["coast_loss"].item())
@@ -305,6 +325,8 @@ def train_vae(
             "recon_loss": recon_loss / max(num_batches, 1),
             "mse_loss": mse_loss / max(num_batches, 1),
             "l1_loss": l1_loss / max(num_batches, 1),
+            "weighted_mse_loss": weighted_mse_loss / max(num_batches, 1),
+            "weighted_l1_loss": weighted_l1_loss / max(num_batches, 1),
             "gradient_loss": gradient_loss / max(num_batches, 1),
             "mask_loss": mask_loss / max(num_batches, 1),
             "coast_loss": coast_loss / max(num_batches, 1),
@@ -320,6 +342,7 @@ def train_vae(
                 f"beta={epoch_metrics['beta']:.3f} "
                 f"total={epoch_metrics['total_loss']:.4f} "
                 f"recon={epoch_metrics['recon_loss']:.4f} "
+                f"wmse={epoch_metrics['weighted_mse_loss']:.4f} "
                 f"grad={epoch_metrics['gradient_loss']:.4f} "
                 f"coast={epoch_metrics['coast_loss']:.4f} "
                 f"struct={epoch_metrics['structure_loss']:.4f} "

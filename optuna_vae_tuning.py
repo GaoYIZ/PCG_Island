@@ -15,7 +15,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
 from dataset_pipeline import IslandDatasetBuilder
-from vae_model import BetaVAE, HeightmapDataset, train_vae
+from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,7 +96,7 @@ def main() -> None:
     arrays = build_arrays(args)
     train_heightmaps, val_heightmaps, train_metrics, val_metrics = train_test_split(
         arrays["heightmaps"],
-        arrays["metric_matrix"],
+        arrays["core_metric_matrix"],
         test_size=0.2,
         random_state=args.seed,
     )
@@ -110,7 +110,9 @@ def main() -> None:
         gradient_loss_weight = trial.suggest_float("gradient_loss_weight", 0.05, 0.40)
         mask_loss_weight = trial.suggest_float("mask_loss_weight", 0.05, 0.35)
         coast_loss_weight = trial.suggest_float("coast_loss_weight", 0.05, 0.35)
-        structure_loss_weight = trial.suggest_float("structure_loss_weight", 0.05, 0.50)
+        structure_loss_weight = trial.suggest_float("structure_loss_weight", 0.15, 0.80)
+        land_recon_focus_weight = trial.suggest_float("land_recon_focus_weight", 0.8, 2.5)
+        coast_recon_focus_weight = trial.suggest_float("coast_recon_focus_weight", 1.0, 3.5)
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 2e-3, log=True)
         warmup_epochs = trial.suggest_int("warmup_epochs", 4, max(args.epochs, 4))
 
@@ -127,6 +129,8 @@ def main() -> None:
             coast_loss_weight=coast_loss_weight,
             structure_dim=train_metrics.shape[1],
             structure_loss_weight=structure_loss_weight,
+            land_recon_focus_weight=land_recon_focus_weight,
+            coast_recon_focus_weight=coast_recon_focus_weight,
         ).to(device)
 
         history = train_vae(
@@ -139,15 +143,23 @@ def main() -> None:
         )
         reconstructions = reconstruct(vae, val_heightmaps, args.batch_size, device)
         predictions = predict_structure(vae, val_heightmaps, args.batch_size, device)
+        latents = encode_heightmaps(vae, val_heightmaps, batch_size=args.batch_size, device=str(device))
 
         pixel_mse = float(np.mean((val_heightmaps - reconstructions) ** 2))
         structure_mae = float(np.mean(np.abs(val_metrics - predictions))) if predictions.size else 0.0
         final_kl = float(history[-1]["kl_loss"]) if history else 0.0
-        objective_value = pixel_mse + 0.35 * structure_mae + 0.05 * final_kl
+        latent_global_std = float(latents.std()) if len(latents) > 0 else 0.0
+        latent_std_per_dim = latents.std(axis=0) if len(latents) > 0 else np.zeros((latent_dim,), dtype=np.float32)
+        active_threshold = max(1e-3, latent_global_std * 0.02)
+        active_ratio = float(np.mean(latent_std_per_dim > active_threshold)) if latent_dim > 0 else 0.0
+        collapse_penalty = max(0.0, 0.35 - active_ratio)
+        objective_value = pixel_mse + 0.55 * structure_mae + 0.08 * final_kl + 0.40 * collapse_penalty
 
         trial.set_user_attr("pixel_mse", pixel_mse)
         trial.set_user_attr("structure_mae", structure_mae)
         trial.set_user_attr("final_kl", final_kl)
+        trial.set_user_attr("active_ratio", active_ratio)
+        trial.set_user_attr("latent_global_std", latent_global_std)
         return objective_value
 
     study = optuna.create_study(direction="minimize", study_name="island_vae_tuning")

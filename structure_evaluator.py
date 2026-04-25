@@ -14,6 +14,14 @@ from scipy import ndimage
 class StructureEvaluator:
     """Extracts compact terrain descriptors from an island heightmap."""
 
+    core_metric_names: Sequence[str] = (
+        "connectivity",
+        "navigable_ratio",
+        "coast_complexity",
+        "terrain_variance",
+        "path_reachability",
+    )
+
     metric_names: Sequence[str] = (
         "connectivity",
         "navigable_ratio",

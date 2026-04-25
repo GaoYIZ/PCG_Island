@@ -65,12 +65,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-mask-loss-weight", type=float, default=0.15, help="陆地掩码重建损失权重")
     parser.add_argument("--vae-coast-loss-weight", type=float, default=0.20, help="海岸线重建损失权重")
     parser.add_argument("--vae-structure-loss-weight", type=float, default=0.20, help="结构指标监督损失权重")
+    parser.add_argument("--vae-land-recon-focus-weight", type=float, default=1.5, help="陆地区域重建聚焦权重")
+    parser.add_argument("--vae-coast-recon-focus-weight", type=float, default=2.0, help="海岸带重建聚焦权重")
     parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE 学习率")
     parser.add_argument("--ppo-episodes", type=int, default=60, help="PPO 训练轮数")
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="PPO 单轮最大步数")
     parser.add_argument("--ppo-hidden-dim", type=int, default=256, help="PPO 隐层维度")
     parser.add_argument("--sac-episodes", type=int, default=0, help="SAC 补充训练轮数，0 表示跳过")
     parser.add_argument("--eval-islands", type=int, default=12, help="最终评估的地图数")
+    parser.add_argument("--skip-rl", action="store_true", help="只运行到 VAE 评估，跳过 RL 与策略对比")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     return parser.parse_args()
 
@@ -349,7 +352,7 @@ def train_formal_vae(
     print_section("第二阶段：VAE 训练与隐向量提取")
     dataset = HeightmapDataset(
         arrays["heightmaps"],
-        structure_targets=arrays["metric_matrix"],
+        structure_targets=arrays["core_metric_matrix"],
         augment=True,
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
@@ -363,8 +366,10 @@ def train_formal_vae(
         gradient_loss_weight=args.vae_gradient_loss_weight,
         mask_loss_weight=args.vae_mask_loss_weight,
         coast_loss_weight=args.vae_coast_loss_weight,
-        structure_dim=arrays["metric_matrix"].shape[1],
+        structure_dim=arrays["core_metric_matrix"].shape[1],
         structure_loss_weight=args.vae_structure_loss_weight,
+        land_recon_focus_weight=args.vae_land_recon_focus_weight,
+        coast_recon_focus_weight=args.vae_coast_recon_focus_weight,
     ).to(device)
     start_time = time.time()
     history = train_vae(
@@ -411,6 +416,8 @@ def train_formal_vae(
                 "mask_loss_weight": args.vae_mask_loss_weight,
                 "coast_loss_weight": args.vae_coast_loss_weight,
                 "structure_loss_weight": args.vae_structure_loss_weight,
+                "land_recon_focus_weight": args.vae_land_recon_focus_weight,
+                "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
                 "learning_rate": args.vae_lr,
             },
             "vae_history": history,
@@ -433,6 +440,8 @@ def evaluate_vae_representation(
 
     reconstructions = reconstruct_heightmaps(vae, arrays["heightmaps"], args.batch_size, device)
     original_metrics = arrays["metric_matrix"]
+    core_metric_names = tuple(builder.evaluator.core_metric_names)
+    core_original_metrics = arrays["core_metric_matrix"]
     reconstructed_metrics = np.array(
         [
             [builder.evaluator.evaluate(heightmap)[name] for name in builder.evaluator.metric_names]
@@ -459,18 +468,18 @@ def evaluate_vae_representation(
 
     structure_head_mae = {}
     structure_head_corr = {}
-    if structure_predictions.shape == original_metrics.shape:
-        for idx, name in enumerate(builder.evaluator.metric_names):
+    if structure_predictions.shape == core_original_metrics.shape:
+        for idx, name in enumerate(core_metric_names):
             predicted = structure_predictions[:, idx]
-            origin = original_metrics[:, idx]
+            origin = core_original_metrics[:, idx]
             structure_head_mae[name] = float(np.mean(np.abs(origin - predicted)))
             if np.std(origin) < 1e-8 or np.std(predicted) < 1e-8:
                 structure_head_corr[name] = 0.0
             else:
                 structure_head_corr[name] = float(np.corrcoef(origin, predicted)[0, 1])
     else:
-        structure_head_mae = {name: 0.0 for name in builder.evaluator.metric_names}
-        structure_head_corr = {name: 0.0 for name in builder.evaluator.metric_names}
+        structure_head_mae = {name: 0.0 for name in core_metric_names}
+        structure_head_corr = {name: 0.0 for name in core_metric_names}
 
     latent_std_per_dim = latents.std(axis=0) if len(latents) > 0 else np.zeros((args.latent_dim,), dtype=np.float32)
     latent_global_std = float(latents.std()) if len(latents) > 0 else 0.0
@@ -481,8 +490,8 @@ def evaluate_vae_representation(
     if len(latents) >= 6:
         n_splits = min(5, len(latents))
         kfold = KFold(n_splits=n_splits, shuffle=True, random_state=args.seed)
-        for idx, name in enumerate(builder.evaluator.metric_names):
-            target = original_metrics[:, idx]
+        for idx, name in enumerate(core_metric_names):
+            target = core_original_metrics[:, idx]
             if float(np.std(target)) < 1e-8:
                 predictive_r2[name] = 0.0
                 continue
@@ -495,7 +504,7 @@ def evaluate_vae_representation(
             )
             predictive_r2[name] = float(np.mean(scores))
     else:
-        predictive_r2 = {name: 0.0 for name in builder.evaluator.metric_names}
+        predictive_r2 = {name: 0.0 for name in core_metric_names}
 
     land_index = builder.evaluator.metric_names.index("land_ratio")
     plot_metric_bars(metric_mae, "VAE 结构指标重建误差", "平均绝对误差", output_dir / "vae_metric_mae.png")
@@ -837,6 +846,26 @@ def main() -> None:
     print(f"latent 维度         : {latents.shape[1]}")
 
     vae_summary = evaluate_vae_representation(args, builder, arrays, vae, latents, output_dir, device)
+
+    if args.skip_rl:
+        final_summary: Dict[str, object] = {
+            "清洗后有效样本数": clean_summary["num_valid"],
+            "采样策略": args.sampling_profile,
+            "VAE latent 维度": latents.shape[1],
+            "评分器配置": builder.scorer.describe(),
+            "VAE 表征评估": vae_summary,
+        }
+        save_json(final_summary, output_dir / "final_summary.json")
+        print_section("实验完成")
+        print(f"结果文件已保存到    : {output_dir.resolve()}")
+        print("本次运行模式        : 仅 VAE / 跳过 RL")
+        print("核心输出包括        :")
+        print("- dataset_summary_raw.json / dataset_summary_clean.json")
+        print("- dataset_samples.png / dataset_score_extremes.png")
+        print("- vae_training_curve.png / vae_reconstruction.png")
+        print("- vae_representation_summary.json / vae_metric_mae.png / vae_structure_head_mae.png / vae_latent_space.png")
+        print("- final_summary.json")
+        return
 
     env_factory = build_env_factory(args, vae, feature_normalizer)
     zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
