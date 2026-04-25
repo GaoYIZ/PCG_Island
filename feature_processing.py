@@ -13,7 +13,7 @@ import numpy as np
 DEFAULT_METRIC_BOUNDS: Dict[str, tuple[float, float]] = {
     "connectivity": (0.0, 1.0),
     "navigable_ratio": (0.0, 1.0),
-    "coast_complexity": (0.8, 3.5),
+    "coast_complexity": (0.8, 12.0),
     "terrain_variance": (0.0, 0.35),
     "path_reachability": (0.0, 1.0),
     "land_ratio": (0.0, 1.0),
@@ -160,10 +160,14 @@ class IslandFeatureNormalizer:
     def transform_state(
         self,
         metrics: Mapping[str, float],
+        param_vector: Optional[Sequence[float]] = None,
         latent_vector: Optional[Sequence[float]] = None,
     ) -> np.ndarray:
+        features: list[np.ndarray] = []
+        if param_vector is not None:
+            features.append(np.asarray(param_vector, dtype=np.float32))
         metric_features = self.transform_metrics(metrics)
-        if latent_vector is None:
-            return metric_features.astype(np.float32)
-        latent_features = self.transform_latent(latent_vector)
-        return np.concatenate([latent_features, metric_features]).astype(np.float32)
+        if latent_vector is not None:
+            features.append(self.transform_latent(latent_vector))
+        features.append(metric_features)
+        return np.concatenate(features).astype(np.float32)

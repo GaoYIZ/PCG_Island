@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-gradient-loss-weight", type=float, default=0.20, help="边界/梯度重建损失权重")
     parser.add_argument("--vae-mask-loss-weight", type=float, default=0.15, help="陆地掩码重建损失权重")
     parser.add_argument("--vae-coast-loss-weight", type=float, default=0.20, help="海岸线重建损失权重")
+    parser.add_argument("--vae-structure-loss-weight", type=float, default=0.20, help="结构指标监督损失权重")
     parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE 学习率")
     parser.add_argument("--ppo-episodes", type=int, default=60, help="PPO 训练轮数")
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="PPO 单轮最大步数")
@@ -254,9 +255,32 @@ def reconstruct_heightmaps(
     with torch.no_grad():
         for start in range(0, len(heightmaps), batch_size):
             batch = torch.as_tensor(heightmaps[start : start + batch_size], dtype=torch.float32, device=device)
-            reconstruction, _, _ = vae(batch.unsqueeze(1))
+            reconstruction, _, _, _ = vae(batch.unsqueeze(1))
             batches.append(reconstruction.squeeze(1).cpu().numpy())
     return np.concatenate(batches, axis=0) if batches else np.empty_like(heightmaps)
+
+
+def predict_structure_targets(
+    vae: BetaVAE,
+    heightmaps: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    if vae.structure_predictor is None:
+        return np.empty((len(heightmaps), 0), dtype=np.float32)
+
+    vae.eval()
+    predictions: List[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, len(heightmaps), batch_size):
+            batch = torch.as_tensor(heightmaps[start : start + batch_size], dtype=torch.float32, device=device)
+            mu, _ = vae.encode(batch.unsqueeze(1))
+            predicted = vae.predict_structure(mu)
+            if predicted is not None:
+                predictions.append(predicted.cpu().numpy())
+    if not predictions:
+        return np.empty((len(heightmaps), 0), dtype=np.float32)
+    return np.concatenate(predictions, axis=0)
 
 
 def build_dataset(
@@ -323,7 +347,11 @@ def train_formal_vae(
     device: torch.device,
 ) -> Tuple[BetaVAE, np.ndarray, List[dict]]:
     print_section("第二阶段：VAE 训练与隐向量提取")
-    dataset = HeightmapDataset(arrays["heightmaps"], augment=True)
+    dataset = HeightmapDataset(
+        arrays["heightmaps"],
+        structure_targets=arrays["metric_matrix"],
+        augment=True,
+    )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
     vae = BetaVAE(
@@ -335,6 +363,8 @@ def train_formal_vae(
         gradient_loss_weight=args.vae_gradient_loss_weight,
         mask_loss_weight=args.vae_mask_loss_weight,
         coast_loss_weight=args.vae_coast_loss_weight,
+        structure_dim=arrays["metric_matrix"].shape[1],
+        structure_loss_weight=args.vae_structure_loss_weight,
     ).to(device)
     start_time = time.time()
     history = train_vae(
@@ -380,6 +410,7 @@ def train_formal_vae(
                 "gradient_loss_weight": args.vae_gradient_loss_weight,
                 "mask_loss_weight": args.vae_mask_loss_weight,
                 "coast_loss_weight": args.vae_coast_loss_weight,
+                "structure_loss_weight": args.vae_structure_loss_weight,
                 "learning_rate": args.vae_lr,
             },
             "vae_history": history,
@@ -409,6 +440,7 @@ def evaluate_vae_representation(
         ],
         dtype=np.float32,
     )
+    structure_predictions = predict_structure_targets(vae, arrays["heightmaps"], args.batch_size, device)
 
     pixel_mse = float(np.mean((arrays["heightmaps"] - reconstructions) ** 2))
     pixel_mae = float(np.mean(np.abs(arrays["heightmaps"] - reconstructions)))
@@ -424,6 +456,21 @@ def evaluate_vae_representation(
             metric_corr[name] = 0.0
         else:
             metric_corr[name] = float(np.corrcoef(origin, recon)[0, 1])
+
+    structure_head_mae = {}
+    structure_head_corr = {}
+    if structure_predictions.shape == original_metrics.shape:
+        for idx, name in enumerate(builder.evaluator.metric_names):
+            predicted = structure_predictions[:, idx]
+            origin = original_metrics[:, idx]
+            structure_head_mae[name] = float(np.mean(np.abs(origin - predicted)))
+            if np.std(origin) < 1e-8 or np.std(predicted) < 1e-8:
+                structure_head_corr[name] = 0.0
+            else:
+                structure_head_corr[name] = float(np.corrcoef(origin, predicted)[0, 1])
+    else:
+        structure_head_mae = {name: 0.0 for name in builder.evaluator.metric_names}
+        structure_head_corr = {name: 0.0 for name in builder.evaluator.metric_names}
 
     latent_std_per_dim = latents.std(axis=0) if len(latents) > 0 else np.zeros((args.latent_dim,), dtype=np.float32)
     latent_global_std = float(latents.std()) if len(latents) > 0 else 0.0
@@ -453,6 +500,12 @@ def evaluate_vae_representation(
     land_index = builder.evaluator.metric_names.index("land_ratio")
     plot_metric_bars(metric_mae, "VAE 结构指标重建误差", "平均绝对误差", output_dir / "vae_metric_mae.png")
     plot_metric_bars(
+        structure_head_mae,
+        "VAE latent 结构头误差",
+        "平均绝对误差",
+        output_dir / "vae_structure_head_mae.png",
+    )
+    plot_metric_bars(
         predictive_r2,
         "隐向量对结构指标的预测能力",
         "R²",
@@ -470,6 +523,8 @@ def evaluate_vae_representation(
         "pixel_mae": pixel_mae,
         "metric_reconstruction_mae": metric_mae,
         "metric_reconstruction_correlation": metric_corr,
+        "structure_head_mae": structure_head_mae,
+        "structure_head_correlation": structure_head_corr,
         "latent_global_mean": float(latents.mean()) if len(latents) > 0 else 0.0,
         "latent_global_std": latent_global_std,
         "active_latent_threshold": active_dim_threshold,
@@ -483,6 +538,8 @@ def evaluate_vae_representation(
     print(f"活跃 latent 维度    : {active_dims} / {latents.shape[1]}")
     print("\n重建后结构指标 MAE:")
     print_metric_dict(metric_mae, precision=4)
+    print("\n结构监督头 MAE:")
+    print_metric_dict(structure_head_mae, precision=4)
     print("\nlatent 对结构指标的预测 R2:")
     print_metric_dict(predictive_r2, precision=4)
 
@@ -773,7 +830,9 @@ def main() -> None:
     print_section("第三阶段：特征归一化拟合")
     metric_names = builder.evaluator.metric_names
     feature_normalizer = builder.fit_feature_normalizer(clean_samples, latent_matrix=latents)
-    print(f"状态特征维度        : {len(metric_names) + latents.shape[1]}")
+    param_dim = len(builder.param_normalizer.param_names)
+    print(f"状态特征维度        : {param_dim + len(metric_names) + latents.shape[1]}")
+    print(f"参数维度            : {param_dim}")
     print(f"结构指标维度        : {len(metric_names)}")
     print(f"latent 维度         : {latents.shape[1]}")
 
@@ -818,7 +877,7 @@ def main() -> None:
     print("- dataset_summary_raw.json / dataset_summary_clean.json")
     print("- dataset_samples.png / dataset_score_extremes.png")
     print("- vae_training_curve.png / vae_reconstruction.png")
-    print("- vae_representation_summary.json / vae_metric_mae.png / vae_latent_space.png")
+    print("- vae_representation_summary.json / vae_metric_mae.png / vae_structure_head_mae.png / vae_latent_space.png")
     print("- zero/random/ppo_evaluation_summary.json")
     print("- policy_comparison.json / final_summary.json")
     if args.sac_episodes > 0:

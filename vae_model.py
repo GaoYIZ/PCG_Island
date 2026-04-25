@@ -27,6 +27,8 @@ class BetaVAE(nn.Module):
         land_threshold: float = 0.30,
         mask_loss_weight: float = 0.15,
         coast_loss_weight: float = 0.20,
+        structure_dim: int = 0,
+        structure_loss_weight: float = 0.0,
     ):
         super().__init__()
         if map_size != 64:
@@ -42,6 +44,8 @@ class BetaVAE(nn.Module):
         self.land_threshold = float(land_threshold)
         self.mask_loss_weight = float(mask_loss_weight)
         self.coast_loss_weight = float(coast_loss_weight)
+        self.structure_dim = int(structure_dim)
+        self.structure_loss_weight = float(structure_loss_weight)
 
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=4, stride=2, padding=1),
@@ -69,6 +73,14 @@ class BetaVAE(nn.Module):
             nn.ConvTranspose2d(32, 1, kernel_size=4, stride=2, padding=1),
             nn.Sigmoid(),
         )
+        if self.structure_dim > 0:
+            self.structure_predictor = nn.Sequential(
+                nn.Linear(latent_dim, latent_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(latent_dim, self.structure_dim),
+            )
+        else:
+            self.structure_predictor = None
 
     def set_beta(self, beta: float) -> None:
         self.current_beta = float(beta)
@@ -95,11 +107,17 @@ class BetaVAE(nn.Module):
         hidden = self.decoder_input(z)
         return self.decoder(hidden)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def predict_structure(self, latent: torch.Tensor) -> torch.Tensor | None:
+        if self.structure_predictor is None:
+            return None
+        return self.structure_predictor(latent)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         reconstruction = self.decode(z)
-        return reconstruction, mu, logvar
+        structure_prediction = self.predict_structure(mu)
+        return reconstruction, mu, logvar, structure_prediction
 
     @staticmethod
     def _gradient_map(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -122,6 +140,8 @@ class BetaVAE(nn.Module):
         target: torch.Tensor,
         mu: torch.Tensor,
         logvar: torch.Tensor,
+        structure_prediction: torch.Tensor | None = None,
+        structure_target: torch.Tensor | None = None,
     ) -> dict:
         mse_loss = F.mse_loss(reconstruction, target, reduction="mean")
         l1_loss = F.l1_loss(reconstruction, target, reduction="mean")
@@ -151,7 +171,15 @@ class BetaVAE(nn.Module):
 
         kl_per_dim = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp(), dim=0)
         kl_divergence = torch.mean(torch.clamp(kl_per_dim, min=self.free_bits))
-        total_loss = recon_loss + self.current_beta * kl_divergence
+        structure_loss = torch.zeros((), device=target.device)
+        if (
+            self.structure_loss_weight > 0.0
+            and structure_prediction is not None
+            and structure_target is not None
+        ):
+            structure_loss = F.smooth_l1_loss(structure_prediction, structure_target, reduction="mean")
+
+        total_loss = recon_loss + self.current_beta * kl_divergence + self.structure_loss_weight * structure_loss
         return {
             "total_loss": total_loss,
             "recon_loss": recon_loss,
@@ -160,6 +188,7 @@ class BetaVAE(nn.Module):
             "gradient_loss": gradient_loss,
             "mask_loss": mask_loss,
             "coast_loss": coast_loss,
+            "structure_loss": structure_loss,
             "kl_divergence": kl_divergence,
             "kl_raw": torch.mean(kl_per_dim),
             "beta": torch.tensor(self.current_beta, device=target.device),
@@ -179,14 +208,22 @@ class BetaVAE(nn.Module):
 class HeightmapDataset(Dataset):
     """Simple dataset wrapper for heightmaps shaped as (N, H, W)."""
 
-    def __init__(self, heightmaps: np.ndarray, augment: bool = False):
+    def __init__(
+        self,
+        heightmaps: np.ndarray,
+        structure_targets: np.ndarray | None = None,
+        augment: bool = False,
+    ):
         self.heightmaps = np.asarray(heightmaps, dtype=np.float32)
+        self.structure_targets = (
+            None if structure_targets is None else np.asarray(structure_targets, dtype=np.float32)
+        )
         self.augment = augment
 
     def __len__(self) -> int:
         return len(self.heightmaps)
 
-    def __getitem__(self, index: int) -> torch.Tensor:
+    def __getitem__(self, index: int):
         heightmap = self.heightmaps[index]
         if self.augment:
             rotation_k = int(np.random.randint(0, 4))
@@ -195,7 +232,10 @@ class HeightmapDataset(Dataset):
                 heightmap = np.flip(heightmap, axis=0).copy()
             if np.random.rand() < 0.5:
                 heightmap = np.flip(heightmap, axis=1).copy()
-        return torch.from_numpy(heightmap).unsqueeze(0)
+        heightmap_tensor = torch.from_numpy(heightmap).unsqueeze(0)
+        if self.structure_targets is None:
+            return heightmap_tensor
+        return heightmap_tensor, torch.from_numpy(self.structure_targets[index])
 
 
 def train_vae(
@@ -220,16 +260,29 @@ def train_vae(
         gradient_loss = 0.0
         mask_loss = 0.0
         coast_loss = 0.0
+        structure_loss = 0.0
         kl_loss = 0.0
         kl_raw = 0.0
         num_batches = 0
 
         for batch in dataloader:
+            if isinstance(batch, (list, tuple)):
+                batch, structure_target = batch
+                structure_target = structure_target.to(device)
+            else:
+                structure_target = None
             batch = batch.to(device)
             optimizer.zero_grad()
 
-            reconstruction, mu, logvar = vae(batch)
-            losses = vae.loss_function(reconstruction, batch, mu, logvar)
+            reconstruction, mu, logvar, structure_prediction = vae(batch)
+            losses = vae.loss_function(
+                reconstruction,
+                batch,
+                mu,
+                logvar,
+                structure_prediction=structure_prediction,
+                structure_target=structure_target,
+            )
             losses["total_loss"].backward()
             optimizer.step()
 
@@ -240,6 +293,7 @@ def train_vae(
             gradient_loss += float(losses["gradient_loss"].item())
             mask_loss += float(losses["mask_loss"].item())
             coast_loss += float(losses["coast_loss"].item())
+            structure_loss += float(losses["structure_loss"].item())
             kl_loss += float(losses["kl_divergence"].item())
             kl_raw += float(losses["kl_raw"].item())
             num_batches += 1
@@ -254,6 +308,7 @@ def train_vae(
             "gradient_loss": gradient_loss / max(num_batches, 1),
             "mask_loss": mask_loss / max(num_batches, 1),
             "coast_loss": coast_loss / max(num_batches, 1),
+            "structure_loss": structure_loss / max(num_batches, 1),
             "kl_loss": kl_loss / max(num_batches, 1),
             "kl_raw": kl_raw / max(num_batches, 1),
         }
@@ -267,6 +322,7 @@ def train_vae(
                 f"recon={epoch_metrics['recon_loss']:.4f} "
                 f"grad={epoch_metrics['gradient_loss']:.4f} "
                 f"coast={epoch_metrics['coast_loss']:.4f} "
+                f"struct={epoch_metrics['structure_loss']:.4f} "
                 f"kl={epoch_metrics['kl_loss']:.4f}"
             )
 

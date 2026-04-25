@@ -45,8 +45,54 @@ class IslandPipelineTests(unittest.TestCase):
         metrics = self.evaluator.evaluate(heightmap)
 
         self.assertIn("land_ratio", metrics)
-        self.assertEqual(set(metrics.keys()), set(self.evaluator.metric_names))
+        for name in self.evaluator.metric_names:
+            self.assertIn(name, metrics)
+        self.assertIn("component_count", metrics)
+        self.assertIn("path_exists", metrics)
         self.assertTrue(0.0 <= metrics["land_ratio"] <= 1.0)
+
+    def test_navigability_responds_to_local_terrain_roughness(self) -> None:
+        rng = np.random.default_rng(0)
+        rough_heightmap = (0.35 + 0.65 * rng.random((64, 64))).astype(np.float32)
+        metrics = self.evaluator.evaluate(rough_heightmap)
+
+        self.assertLess(metrics["navigable_ratio"], 0.8)
+        self.assertGreaterEqual(metrics["navigable_ratio"], 0.0)
+
+    def test_astar_reachability_distinguishes_connected_paths(self) -> None:
+        evaluator = StructureEvaluator(map_size=8, path_sample_points=4, max_path_pairs=6)
+        slope = np.zeros((8, 8), dtype=np.float32)
+
+        connected = np.zeros((8, 8), dtype=bool)
+        connected[1:7, 3] = True
+        connected[4, 1:7] = True
+
+        disconnected = np.zeros((8, 8), dtype=bool)
+        disconnected[1:3, 1:3] = True
+        disconnected[5:7, 5:7] = True
+
+        connected_score = evaluator._check_path_reachability(connected, slope=slope)
+        disconnected_score = evaluator._check_path_reachability(disconnected, slope=slope)
+
+        self.assertGreater(connected_score, disconnected_score)
+        self.assertAlmostEqual(connected_score, 1.0, places=6)
+        self.assertLess(disconnected_score, 1.0)
+
+    def test_coast_complexity_rewards_jagged_coastline(self) -> None:
+        smooth = np.zeros((16, 16), dtype=bool)
+        smooth[4:12, 4:12] = True
+
+        jagged = np.zeros((16, 16), dtype=bool)
+        jagged[4:12, 4:12] = True
+        jagged[3, 6:10] = True
+        jagged[12, 5:11] = True
+        jagged[6:10, 3] = True
+        jagged[5:11, 12] = True
+
+        smooth_complexity = self.evaluator._calculate_coast_complexity(smooth)
+        jagged_complexity = self.evaluator._calculate_coast_complexity(jagged)
+
+        self.assertGreater(jagged_complexity, smooth_complexity)
 
     def test_dataset_builder_cleans_and_summarizes(self) -> None:
         builder = IslandDatasetBuilder(map_size=64, scorer=self.scorer)
@@ -77,7 +123,8 @@ class IslandPipelineTests(unittest.TestCase):
         normalizer = IslandFeatureNormalizer(metric_names=self.evaluator.metric_names)
         normalizer.fit(metric_matrix=metric_matrix, latent_matrix=latent_matrix)
 
-        state = normalizer.transform_state(metrics_list[0], latent_matrix[0])
+        param_vector = np.linspace(-1.0, 1.0, 9, dtype=np.float32)
+        state = normalizer.transform_state(param_vector=param_vector, metrics=metrics_list[0], latent_vector=latent_matrix[0])
         self.assertTrue(np.all(state <= 1.0 + 1e-6))
         self.assertTrue(np.all(state >= -1.0 - 1e-6))
 
@@ -100,6 +147,9 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertTrue(np.all(state <= 1.0 + 1e-6))
         self.assertTrue(np.all(state >= -1.0 - 1e-6))
         self.assertIn("land_score", info["score"])
+        param_dim = len(env.param_normalizer.param_names)
+        expected_params = env.param_normalizer.normalize_params(env.current_params)
+        np.testing.assert_allclose(state[:param_dim], expected_params, atol=1e-6)
 
         next_state, reward, terminated, truncated, info = env.step(env.action_space.sample())
         self.assertEqual(next_state.shape, env.observation_space.shape)
@@ -141,7 +191,11 @@ class IslandPipelineTests(unittest.TestCase):
             ],
             axis=0,
         )
-        dataset = HeightmapDataset(heightmaps)
+        structure_targets = np.array(
+            [[self.evaluator.evaluate(heightmap)[name] for name in self.evaluator.metric_names] for heightmap in heightmaps],
+            dtype=np.float32,
+        )
+        dataset = HeightmapDataset(heightmaps, structure_targets=structure_targets)
         dataloader = DataLoader(dataset, batch_size=5, shuffle=False)
         vae = BetaVAE(
             map_size=64,
@@ -150,6 +204,8 @@ class IslandPipelineTests(unittest.TestCase):
             beta_start=0.0,
             free_bits=0.01,
             gradient_loss_weight=0.20,
+            structure_dim=structure_targets.shape[1],
+            structure_loss_weight=0.2,
         )
         history = train_vae(vae, dataloader, epochs=1, device="cpu", warmup_epochs=1)
         latents = encode_heightmaps(vae, heightmaps, batch_size=5, device="cpu")
@@ -159,6 +215,7 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertIn("gradient_loss", history[0])
         self.assertIn("mask_loss", history[0])
         self.assertIn("coast_loss", history[0])
+        self.assertIn("structure_loss", history[0])
         self.assertIn("kl_raw", history[0])
         self.assertEqual(latents.shape, (10, 8))
 

@@ -55,7 +55,8 @@ class IslandGenerationEnv(gym.Env):
 
         self.latent_dim = int(getattr(vae_model, "latent_dim", 0)) if self.include_latent else 0
         self.metric_dim = len(self.evaluator.metric_names)
-        self.state_dim = self.metric_dim + self.latent_dim
+        self.param_dim = len(self.param_normalizer.param_names)
+        self.state_dim = self.param_dim + self.metric_dim + self.latent_dim
 
         self.action_space = spaces.Box(
             low=-1.0,
@@ -91,7 +92,6 @@ class IslandGenerationEnv(gym.Env):
         self.current_heightmap = self.generator.generate_heightmap(self.current_params)
         self.current_metrics = self.evaluator.evaluate(self.current_heightmap)
         self.current_latent = self._encode_latent(self.current_heightmap)
-        self.history_buffer = []
         self.steps = 0
 
         state = self._get_state()
@@ -148,6 +148,7 @@ class IslandGenerationEnv(gym.Env):
         if self.current_metrics is None:
             raise RuntimeError("No metrics available. Call reset() first.")
         return self.feature_normalizer.transform_state(
+            param_vector=self.param_normalizer.normalize_params(self.current_params or {}),
             metrics=self.current_metrics,
             latent_vector=self.current_latent if self.include_latent else None,
         )

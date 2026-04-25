@@ -193,7 +193,7 @@ class IslandDatasetBuilder:
             reasons.append("too_much_land")
         if metrics["connectivity"] < 0.90:
             reasons.append("weak_connectivity")
-        if metrics["path_reachability"] < 0.80:
+        if metrics["path_reachability"] < 0.25:
             reasons.append("poor_reachability")
         if metrics["terrain_variance"] < 0.04:
             reasons.append("too_flat")
