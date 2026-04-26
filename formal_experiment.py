@@ -47,37 +47,102 @@ COAST_THRESHOLD = 0.30
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="IslandTest 正式实验运行脚本")
-    parser.add_argument("--output-dir", type=str, default="formal_outputs", help="结果输出目录")
-    parser.add_argument("--map-size", type=int, default=128, help="地图尺寸")
-    parser.add_argument("--dataset-samples", type=int, default=120, help="每轮采样的原始样本数")
-    parser.add_argument("--min-clean-samples", type=int, default=48, help="清洗后至少保留的样本数")
-    parser.add_argument("--max-dataset-samples", type=int, default=480, help="数据集构建阶段允许的最大原始样本数")
-    parser.add_argument("--sampling-profile", type=str, default="island", choices=["uniform", "island"], help="参数采样策略")
-    parser.add_argument("--batch-size", type=int, default=32, help="VAE 和 PPO 的批大小")
-    parser.add_argument("--latent-dim", type=int, default=128, help="VAE latent 维度")
-    parser.add_argument("--vae-epochs", type=int, default=30, help="VAE 训练轮数")
-    parser.add_argument("--vae-beta", type=float, default=0.25, help="Beta-VAE 的 beta")
-    parser.add_argument("--vae-beta-start", type=float, default=0.0, help="KL warmup 起始 beta")
-    parser.add_argument("--vae-warmup-epochs", type=int, default=12, help="KL warmup 轮数")
-    parser.add_argument("--vae-free-bits", type=float, default=0.01, help="每个 latent 维度的最小 KL")
-    parser.add_argument("--vae-gradient-loss-weight", type=float, default=0.20, help="边界/梯度重建损失权重")
-    parser.add_argument("--vae-mask-loss-weight", type=float, default=0.15, help="陆地掩码重建损失权重")
-    parser.add_argument("--vae-coast-loss-weight", type=float, default=0.28, help="海岸线重建损失权重")
-    parser.add_argument("--vae-land-dice-loss-weight", type=float, default=0.12, help="陆地区域 Dice 重建损失权重")
-    parser.add_argument("--vae-coast-dice-loss-weight", type=float, default=0.32, help="海岸带 Dice 重建损失权重")
-    parser.add_argument("--vae-structure-loss-weight", type=float, default=0.12, help="结构指标监督损失权重")
-    parser.add_argument("--vae-land-recon-focus-weight", type=float, default=2.0, help="陆地区域重建聚焦权重")
-    parser.add_argument("--vae-coast-recon-focus-weight", type=float, default=3.2, help="海岸带重建聚焦权重")
-    parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE 学习率")
-    parser.add_argument("--ppo-episodes", type=int, default=60, help="PPO 训练轮数")
-    parser.add_argument("--ppo-max-steps", type=int, default=30, help="PPO 单轮最大步数")
-    parser.add_argument("--ppo-hidden-dim", type=int, default=256, help="PPO 隐层维度")
-    parser.add_argument("--sac-episodes", type=int, default=0, help="SAC 补充训练轮数，0 表示跳过")
-    parser.add_argument("--eval-islands", type=int, default=12, help="最终评估的地图数")
-    parser.add_argument("--skip-rl", action="store_true", help="只运行到 VAE 评估，跳过 RL 与策略对比")
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser = argparse.ArgumentParser(description="IslandTest formal experiment runner")
+    parser.add_argument("--output-dir", type=str, default="formal_outputs", help="Result output directory")
+    parser.add_argument("--map-size", type=int, default=128, help="Heightmap size")
+    parser.add_argument("--dataset-samples", type=int, default=120, help="Raw samples generated per sampling round")
+    parser.add_argument("--min-clean-samples", type=int, default=48, help="Minimum clean samples kept after filtering")
+    parser.add_argument("--max-dataset-samples", type=int, default=480, help="Maximum raw samples allowed during dataset building")
+    parser.add_argument("--sampling-profile", type=str, default="island", choices=["uniform", "island"], help="Parameter sampling strategy")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for VAE/PPO")
+    parser.add_argument("--latent-dim", type=int, default=128, help="VAE latent dimension")
+    parser.add_argument("--vae-epochs", type=int, default=30, help="VAE training epochs")
+    parser.add_argument("--vae-beta", type=float, default=0.25, help="Beta-VAE beta")
+    parser.add_argument("--vae-beta-start", type=float, default=0.0, help="KL warmup starting beta")
+    parser.add_argument("--vae-warmup-epochs", type=int, default=12, help="KL warmup epochs")
+    parser.add_argument("--vae-free-bits", type=float, default=0.01, help="Minimum KL per latent dimension")
+    parser.add_argument("--vae-gradient-loss-weight", type=float, default=0.20, help="Gradient reconstruction loss weight")
+    parser.add_argument("--vae-mask-loss-weight", type=float, default=0.15, help="Land-mask reconstruction loss weight")
+    parser.add_argument("--vae-coast-loss-weight", type=float, default=0.28, help="Coast reconstruction loss weight")
+    parser.add_argument("--vae-land-dice-loss-weight", type=float, default=0.12, help="Land-region Dice loss weight")
+    parser.add_argument("--vae-coast-dice-loss-weight", type=float, default=0.32, help="Coast-band Dice loss weight")
+    parser.add_argument("--vae-structure-loss-weight", type=float, default=0.12, help="Structure-supervision loss weight")
+    parser.add_argument("--vae-land-recon-focus-weight", type=float, default=2.0, help="Extra reconstruction focus on land pixels")
+    parser.add_argument("--vae-coast-recon-focus-weight", type=float, default=3.2, help="Extra reconstruction focus on coast-band pixels")
+    parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE learning rate")
+    parser.add_argument("--ppo-episodes", type=int, default=60, help="PPO training episodes")
+    parser.add_argument("--ppo-max-steps", type=int, default=30, help="Maximum steps per PPO episode")
+    parser.add_argument("--ppo-hidden-dim", type=int, default=256, help="PPO hidden dimension")
+    parser.add_argument("--sac-episodes", type=int, default=0, help="Extra SAC training episodes; 0 disables SAC")
+    parser.add_argument("--eval-islands", type=int, default=12, help="Number of final evaluation islands")
+    parser.add_argument("--skip-rl", action="store_true", help="Stop after VAE evaluation and skip RL/baselines")
+    parser.add_argument(
+        "--formal-vae-only",
+        action="store_true",
+        help="Run a full VAE-only evaluation with train/val/test splits and no RL",
+    )
+    parser.add_argument("--vae-train-ratio", type=float, default=0.70, help="Train split ratio for formal VAE-only evaluation")
+    parser.add_argument("--vae-val-ratio", type=float, default=0.15, help="Validation split ratio for formal VAE-only evaluation")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
+
+
+def apply_formal_vae_preset(args: argparse.Namespace) -> None:
+    if not args.formal_vae_only:
+        return
+
+    args.skip_rl = True
+    if args.dataset_samples == 120:
+        args.dataset_samples = 500
+    if args.min_clean_samples == 48:
+        args.min_clean_samples = 500
+    if args.max_dataset_samples == 480:
+        args.max_dataset_samples = 2000
+    if args.vae_epochs == 30:
+        args.vae_epochs = 50
+    if args.batch_size == 32:
+        args.batch_size = 16
+
+
+def split_indices(
+    num_samples: int,
+    train_ratio: float,
+    val_ratio: float,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if num_samples < 3:
+        raise ValueError("Formal VAE evaluation requires at least 3 clean samples.")
+    if not (0.0 < train_ratio < 1.0):
+        raise ValueError("vae_train_ratio must be between 0 and 1.")
+    if not (0.0 <= val_ratio < 1.0):
+        raise ValueError("vae_val_ratio must be between 0 and 1.")
+    if train_ratio + val_ratio >= 1.0:
+        raise ValueError("vae_train_ratio + vae_val_ratio must be less than 1.")
+
+    indices = np.arange(num_samples, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(indices)
+
+    train_count = max(1, int(round(num_samples * train_ratio)))
+    val_count = max(1, int(round(num_samples * val_ratio)))
+    if train_count + val_count >= num_samples:
+        val_count = max(1, num_samples - train_count - 1)
+    test_count = num_samples - train_count - val_count
+    if test_count <= 0:
+        test_count = 1
+        if val_count > 1:
+            val_count -= 1
+        else:
+            train_count -= 1
+
+    train_idx = indices[:train_count]
+    val_idx = indices[train_count : train_count + val_count]
+    test_idx = indices[train_count + val_count :]
+    return train_idx, val_idx, test_idx
+
+
+def subset_arrays(arrays: Dict[str, np.ndarray], indices: np.ndarray) -> Dict[str, np.ndarray]:
+    return {name: values[indices] for name, values in arrays.items()}
 
 
 def set_seed(seed: int) -> None:
@@ -483,6 +548,11 @@ def evaluate_vae_representation(
         device,
         deterministic=True,
     )
+    plot_reconstruction(
+        arrays["heightmaps"][:6],
+        reconstructions[:6],
+        output_dir / "vae_reconstruction.png",
+    )
     original_metrics = arrays["metric_matrix"]
     core_metric_names = tuple(builder.evaluator.core_metric_names)
     core_original_metrics = arrays["core_metric_matrix"]
@@ -607,6 +677,116 @@ def evaluate_vae_representation(
 
     save_json(summary, output_dir / "vae_representation_summary.json")
     return summary
+
+
+def run_formal_vae_only_evaluation(
+    args: argparse.Namespace,
+    builder: IslandDatasetBuilder,
+    clean_samples: List,
+    arrays: Dict[str, np.ndarray],
+    output_dir: Path,
+    device: torch.device,
+) -> Dict[str, object]:
+    print_section("Formal VAE-only evaluation")
+
+    train_idx, val_idx, test_idx = split_indices(
+        num_samples=len(arrays["heightmaps"]),
+        train_ratio=args.vae_train_ratio,
+        val_ratio=args.vae_val_ratio,
+        seed=args.seed,
+    )
+    split_indices_map = {
+        "train": train_idx,
+        "val": val_idx,
+        "test": test_idx,
+    }
+    split_arrays_map = {name: subset_arrays(arrays, idx) for name, idx in split_indices_map.items()}
+    split_clean_samples = {name: [clean_samples[int(i)] for i in idx] for name, idx in split_indices_map.items()}
+
+    print(f"train/val/test sizes   : {len(train_idx)} / {len(val_idx)} / {len(test_idx)}")
+
+    train_dir = output_dir / "train_split"
+    train_dir.mkdir(parents=True, exist_ok=True)
+    vae, train_latents, history = train_formal_vae(args, split_arrays_map["train"], train_dir, device)
+
+    split_summaries: Dict[str, Dict[str, object]] = {}
+    split_latents: Dict[str, np.ndarray] = {"train": train_latents}
+    for split_name in ("val", "test"):
+        split_latents[split_name] = encode_heightmaps(
+            vae,
+            split_arrays_map[split_name]["heightmaps"],
+            batch_size=args.batch_size,
+            device=str(device),
+        )
+
+    print_section("Formal VAE split evaluation")
+    for split_name in ("train", "val", "test"):
+        split_dir = output_dir / f"{split_name}_split"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        split_summary = evaluate_vae_representation(
+            args,
+            builder,
+            split_arrays_map[split_name],
+            vae,
+            split_latents[split_name],
+            split_dir,
+            device,
+        )
+        split_summary["num_samples"] = int(len(split_indices_map[split_name]))
+        split_summary["quality_score_mean"] = float(split_arrays_map[split_name]["quality_scores"].mean())
+        split_summary["quality_score_std"] = float(split_arrays_map[split_name]["quality_scores"].std())
+        split_summaries[split_name] = split_summary
+        save_json(builder.evaluate_dataset(split_clean_samples[split_name]), split_dir / "dataset_summary.json")
+
+    generalization_gap = {
+        "pixel_mae_gap_test_minus_train": float(
+            split_summaries["test"]["pixel_mae"] - split_summaries["train"]["pixel_mae"]
+        ),
+        "land_pixel_mae_gap_test_minus_train": float(
+            split_summaries["test"]["land_pixel_mae"] - split_summaries["train"]["land_pixel_mae"]
+        ),
+        "coast_band_mae_gap_test_minus_train": float(
+            split_summaries["test"]["coast_band_mae"] - split_summaries["train"]["coast_band_mae"]
+        ),
+    }
+
+    final_summary: Dict[str, object] = {
+        "mode": "formal_vae_only",
+        "preset_applied": True,
+        "map_size": args.map_size,
+        "latent_dim": args.latent_dim,
+        "vae_epochs": args.vae_epochs,
+        "batch_size": args.batch_size,
+        "sampling_profile": args.sampling_profile,
+        "clean_dataset_size": int(len(clean_samples)),
+        "split_sizes": {
+            "train": int(len(train_idx)),
+            "val": int(len(val_idx)),
+            "test": int(len(test_idx)),
+        },
+        "train_summary": split_summaries["train"],
+        "val_summary": split_summaries["val"],
+        "test_summary": split_summaries["test"],
+        "generalization_gap": generalization_gap,
+        "vae_config": {
+            "beta": args.vae_beta,
+            "beta_start": args.vae_beta_start,
+            "warmup_epochs": args.vae_warmup_epochs,
+            "free_bits": args.vae_free_bits,
+            "gradient_loss_weight": args.vae_gradient_loss_weight,
+            "mask_loss_weight": args.vae_mask_loss_weight,
+            "coast_loss_weight": args.vae_coast_loss_weight,
+            "land_dice_loss_weight": args.vae_land_dice_loss_weight,
+            "coast_dice_loss_weight": args.vae_coast_dice_loss_weight,
+            "structure_loss_weight": args.vae_structure_loss_weight,
+            "land_recon_focus_weight": args.vae_land_recon_focus_weight,
+            "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
+            "learning_rate": args.vae_lr,
+        },
+        "train_history_epochs": len(history),
+    }
+    save_json(final_summary, output_dir / "final_summary.json")
+    return final_summary
 
 
 def build_env_factory(
@@ -868,6 +1048,7 @@ def compare_policy_summaries(policy_summaries: Dict[str, Dict[str, object]]) -> 
 
 def main() -> None:
     args = parse_args()
+    apply_formal_vae_preset(args)
     set_seed(args.seed)
     configure_matplotlib_chinese()
 
@@ -875,18 +1056,42 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print_section("实验启动")
-    print(f"当前设备            : {device}")
-    print(f"输出目录            : {output_dir.resolve()}")
-    print(f"每轮原始样本数      : {args.dataset_samples}")
-    print(f"目标清洗样本数      : {args.min_clean_samples}")
-    print(f"最大原始样本数      : {args.max_dataset_samples}")
-    print(f"采样策略            : {args.sampling_profile}")
-    print(f"VAE 训练轮数        : {args.vae_epochs}")
-    print(f"PPO 训练轮数        : {args.ppo_episodes}")
-    print(f"SAC 训练轮数        : {args.sac_episodes}")
+    print_section("??????")
+    print(f"??????            : {device}")
+    print(f"??????            : {output_dir.resolve()}")
+    print(f"???????????     : {args.dataset_samples}")
+    print(f"???????????     : {args.min_clean_samples}")
+    print(f"???????????      : {args.max_dataset_samples}")
+    print(f"??????            : {args.sampling_profile}")
+    print(f"VAE ??????        : {args.vae_epochs}")
+    print(f"PPO ??????        : {args.ppo_episodes}")
+    print(f"SAC ??????        : {args.sac_episodes}")
+    print(f"??? VAE-only ???   : {args.formal_vae_only}")
 
     builder, clean_samples, arrays, clean_summary = build_dataset(args, output_dir)
+
+    if args.formal_vae_only:
+        final_summary = run_formal_vae_only_evaluation(
+            args=args,
+            builder=builder,
+            clean_samples=clean_samples,
+            arrays=arrays,
+            output_dir=output_dir,
+            device=device,
+        )
+        print_section("??????")
+        print(f"????????????    : {output_dir.resolve()}")
+        print("?????????        : ??? VAE-only")
+        print(
+            f"train/val/test      : {final_summary['split_sizes']['train']} / "
+            f"{final_summary['split_sizes']['val']} / {final_summary['split_sizes']['test']}"
+        )
+        print("- dataset_summary_raw.json / dataset_summary_clean.json")
+        print("- train_split|val_split|test_split/vae_reconstruction.png")
+        print("- train_split|val_split|test_split/vae_representation_summary.json")
+        print("- final_summary.json")
+        return
+
     vae, latents, _ = train_formal_vae(args, arrays, output_dir, device)
 
     print_section("第三阶段：特征归一化拟合")

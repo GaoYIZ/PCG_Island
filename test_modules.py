@@ -18,6 +18,7 @@ from pcg_generator import PCGIslandGenerator
 from ppo_baseline import PPOAgent
 from rl_environment import IslandGenerationEnv
 from structure_evaluator import StructureEvaluator
+from formal_experiment import apply_formal_vae_preset, split_indices, subset_arrays
 from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
 
 
@@ -244,6 +245,41 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertEqual(mu.shape, (2, 128))
         self.assertEqual(logvar.shape, (2, 128))
         self.assertIsNone(structure_prediction)
+
+    def test_formal_vae_split_indices_cover_all_samples(self) -> None:
+        train_idx, val_idx, test_idx = split_indices(
+            num_samples=20,
+            train_ratio=0.70,
+            val_ratio=0.15,
+            seed=42,
+        )
+
+        merged = np.concatenate([train_idx, val_idx, test_idx])
+        self.assertEqual(len(np.unique(merged)), 20)
+        self.assertEqual(set(merged.tolist()), set(range(20)))
+        self.assertGreater(len(train_idx), 0)
+        self.assertGreater(len(val_idx), 0)
+        self.assertGreater(len(test_idx), 0)
+
+    def test_formal_vae_preset_promotes_real_experiment_scale(self) -> None:
+        class Args:
+            formal_vae_only = True
+            skip_rl = False
+            dataset_samples = 120
+            min_clean_samples = 48
+            max_dataset_samples = 480
+            vae_epochs = 30
+            batch_size = 32
+
+        args = Args()
+        apply_formal_vae_preset(args)
+
+        self.assertTrue(args.skip_rl)
+        self.assertEqual(args.dataset_samples, 500)
+        self.assertEqual(args.min_clean_samples, 500)
+        self.assertEqual(args.max_dataset_samples, 2000)
+        self.assertEqual(args.vae_epochs, 50)
+        self.assertEqual(args.batch_size, 16)
 
     def test_cmaes_baseline_runs_in_normalized_space(self) -> None:
         optimizer = CMAESOptimizer(
