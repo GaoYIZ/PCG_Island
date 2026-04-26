@@ -263,8 +263,7 @@ def reconstruct_heightmaps(
             batch = torch.as_tensor(heightmaps[start : start + batch_size], dtype=torch.float32, device=device)
             inputs = batch.unsqueeze(1)
             if deterministic:
-                mu, _ = vae.encode(inputs)
-                reconstruction = vae.decode(mu)
+                reconstruction, _, _, _ = vae.reconstruct_from_input(inputs, deterministic=True)
             else:
                 reconstruction, _, _, _ = vae(inputs)
             batches.append(reconstruction.squeeze(1).cpu().numpy())

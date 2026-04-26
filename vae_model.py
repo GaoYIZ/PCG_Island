@@ -27,6 +27,20 @@ class ResidualRefineBlock(nn.Module):
         return self.activation(x + self.block(x))
 
 
+class InterpUpBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            ResidualRefineBlock(out_channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
 class BetaVAE(nn.Module):
     """Beta-VAE with KL warmup and edge-aware reconstruction for square heightmaps."""
 
@@ -49,12 +63,12 @@ class BetaVAE(nn.Module):
         coast_recon_focus_weight: float = 2.0,
     ):
         super().__init__()
-        if map_size % 16 != 0:
-            raise ValueError("This reference implementation requires map_size to be divisible by 16.")
+        if map_size % 8 != 0:
+            raise ValueError("This reference implementation requires map_size to be divisible by 8.")
 
         self.map_size = map_size
-        self.encoder_output_size = map_size // 16
-        self.encoder_channels = 256
+        self.encoder_output_size = map_size // 8
+        self.encoder_channels = 128
         self.latent_dim = latent_dim
         self.beta = float(beta)
         self.beta_start = float(beta_start)
@@ -78,8 +92,6 @@ class BetaVAE(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
             nn.Flatten(),
         )
         flattened_dim = self.encoder_channels * self.encoder_output_size * self.encoder_output_size
@@ -87,17 +99,10 @@ class BetaVAE(nn.Module):
         self.fc_logvar = nn.Linear(flattened_dim, latent_dim)
 
         self.decoder_input = nn.Linear(latent_dim, flattened_dim)
-        self.decoder = nn.Sequential(
-            nn.Unflatten(1, (self.encoder_channels, self.encoder_output_size, self.encoder_output_size)),
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-        )
+        self.decoder_unflatten = nn.Unflatten(1, (self.encoder_channels, self.encoder_output_size, self.encoder_output_size))
+        self.dec2 = InterpUpBlock(128, 64)
+        self.dec1 = InterpUpBlock(64, 32)
+        self.dec0 = InterpUpBlock(32, 16)
         self.output_head = nn.Sequential(
             ResidualRefineBlock(16),
             ResidualRefineBlock(16),
@@ -134,10 +139,28 @@ class BetaVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        z: torch.Tensor,
+        skips: Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         hidden = self.decoder_input(z)
-        decoded = self.decoder(hidden)
+        decoded = self.decoder_unflatten(hidden)
+        decoded = self.dec2(decoded)
+        decoded = self.dec1(decoded)
+        decoded = self.dec0(decoded)
         return self.output_head(decoded)
+
+    def reconstruct_from_input(
+        self,
+        x: torch.Tensor,
+        deterministic: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        mu, logvar = self.encode(x)
+        latent = mu if deterministic else self.reparameterize(mu, logvar)
+        reconstruction = self.decode(latent)
+        structure_prediction = self.predict_structure(mu)
+        return reconstruction, mu, logvar, structure_prediction
 
     def predict_structure(self, latent: torch.Tensor) -> torch.Tensor | None:
         if self.structure_predictor is None:
@@ -145,11 +168,7 @@ class BetaVAE(nn.Module):
         return self.structure_predictor(latent)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        reconstruction = self.decode(z)
-        structure_prediction = self.predict_structure(mu)
-        return reconstruction, mu, logvar, structure_prediction
+        return self.reconstruct_from_input(x, deterministic=False)
 
     @staticmethod
     def _gradient_map(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
