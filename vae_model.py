@@ -133,6 +133,28 @@ class BetaVAE(nn.Module):
         hidden = self.encoder(x)
         return self.fc_mu(hidden), self.fc_logvar(hidden)
 
+    def encode_with_skips(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Encode and return intermediate feature maps for skip connections."""
+        skips = []
+        
+        # First conv block
+        x1 = F.relu(self.encoder[0](x))  # [B, 32, 64, 64]
+        skips.append(x1)
+        
+        # Second conv block
+        x2 = F.relu(self.encoder[2](x1))  # [B, 64, 32, 32]
+        skips.append(x2)
+        
+        # Third conv block
+        x3 = F.relu(self.encoder[4](x2))  # [B, 128, 16, 16]
+        
+        # Flatten and project to latent
+        x_flat = self.encoder[6](x3)  # Flatten
+        mu = self.fc_mu(x_flat)
+        logvar = self.fc_logvar(x_flat)
+        
+        return mu, logvar, skips
+
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
@@ -142,13 +164,25 @@ class BetaVAE(nn.Module):
     def decode(
         self,
         z: torch.Tensor,
-        skips: Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        skips: List[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         hidden = self.decoder_input(z)
-        decoded = self.decoder_unflatten(hidden)
-        decoded = self.dec2(decoded)
-        decoded = self.dec1(decoded)
-        decoded = self.dec0(decoded)
+        decoded = self.decoder_unflatten(hidden)  # [B, 128, 16, 16]
+        
+        # Upsample with optional skip connections
+        decoded = self.dec2(decoded)  # [B, 64, 32, 32]
+        if skips is not None and len(skips) >= 2:
+            # Add skip connection from encoder's second layer
+            skip2 = skips[1]  # [B, 64, 32, 32]
+            decoded = decoded + skip2
+        
+        decoded = self.dec1(decoded)  # [B, 32, 64, 64]
+        if skips is not None and len(skips) >= 1:
+            # Add skip connection from encoder's first layer
+            skip1 = skips[0]  # [B, 32, 64, 64]
+            decoded = decoded + skip1
+        
+        decoded = self.dec0(decoded)  # [B, 16, 128, 128]
         return self.output_head(decoded)
 
     def reconstruct_from_input(
@@ -156,9 +190,9 @@ class BetaVAE(nn.Module):
         x: torch.Tensor,
         deterministic: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        mu, logvar = self.encode(x)
+        mu, logvar, skips = self.encode_with_skips(x)
         latent = mu if deterministic else self.reparameterize(mu, logvar)
-        reconstruction = self.decode(latent)
+        reconstruction = self.decode(latent, skips=skips)
         structure_prediction = self.predict_structure(mu)
         return reconstruction, mu, logvar, structure_prediction
 
@@ -322,10 +356,17 @@ def train_vae(
     learning_rate: float = 1e-3,
     device: str = "cpu",
     warmup_epochs: int = 10,
+    patience: int = 10,
+    min_epochs: int = 20,
 ) -> List[dict]:
     vae = vae.to(device)
     optimizer = torch.optim.Adam(vae.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-5
+    )
     history: List[dict] = []
+    best_loss = float('inf')
+    patience_counter = 0
 
     for epoch in range(epochs):
         vae.train()
@@ -402,6 +443,17 @@ def train_vae(
             "kl_raw": kl_raw / max(num_batches, 1),
         }
         history.append(epoch_metrics)
+        
+        # Learning rate scheduling
+        scheduler.step(total_loss / max(num_batches, 1))
+        
+        # Early stopping check
+        current_loss = total_loss / max(num_batches, 1)
+        if current_loss < best_loss:
+            best_loss = current_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
         if (epoch + 1) % 5 == 0 or epoch == 0 or epoch + 1 == epochs:
             print(
@@ -414,8 +466,14 @@ def train_vae(
                 f"coast={epoch_metrics['coast_loss']:.4f} "
                 f"coast_dice={epoch_metrics['coast_dice_loss']:.4f} "
                 f"struct={epoch_metrics['structure_loss']:.4f} "
-                f"kl={epoch_metrics['kl_loss']:.4f}"
+                f"kl={epoch_metrics['kl_loss']:.4f} "
+                f"lr={optimizer.param_groups[0]['lr']:.6f}"
             )
+        
+        # Early stopping
+        if epoch + 1 >= min_epochs and patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
 
     return history
 
