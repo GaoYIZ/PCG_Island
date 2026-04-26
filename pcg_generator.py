@@ -59,7 +59,7 @@ class SimplexNoise:
 class PCGIslandGenerator:
     """Generates normalized island heightmaps from parameterized noise."""
 
-    def __init__(self, map_size: int = 64):
+    def __init__(self, map_size: int = 128):
         self.map_size = map_size
         self.noise = SimplexNoise(seed=42)
 
@@ -203,7 +203,7 @@ class PCGIslandGenerator:
 
 
 if __name__ == "__main__":
-    generator = PCGIslandGenerator(map_size=64)
+    generator = PCGIslandGenerator(map_size=128)
     params = generator.sample_random_params(np.random.default_rng(42))
     heightmap = generator.generate_heightmap(params)
     print(f"Heightmap shape: {heightmap.shape}")

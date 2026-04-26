@@ -22,7 +22,7 @@ class CMAESOptimizer:
         param_ranges: Dict[str, Tuple[float, float]],
         sigma0: float = 0.25,
         pop_size: int | None = None,
-        map_size: int = 64,
+        map_size: int = 128,
     ):
         self.param_ranges = dict(param_ranges)
         self.param_normalizer = ParameterSpaceNormalizer(self.param_ranges)
@@ -143,8 +143,8 @@ class CMAESOptimizer:
 
 
 if __name__ == "__main__":
-    generator = PCGIslandGenerator(map_size=64)
-    optimizer = CMAESOptimizer(generator.get_param_ranges(64), sigma0=0.25, pop_size=16, map_size=64)
+    generator = PCGIslandGenerator(map_size=128)
+    optimizer = CMAESOptimizer(generator.get_param_ranges(128), sigma0=0.25, pop_size=16, map_size=128)
     best_params, best_fitness = optimizer.optimize(generations=5, verbose=True)
     decoded = optimizer.param_normalizer.denormalize_vector(best_params)
     print(f"Best fitness: {best_fitness:.4f}")

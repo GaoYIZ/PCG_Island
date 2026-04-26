@@ -224,6 +224,25 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertIn("kl_raw", history[0])
         self.assertEqual(latents.shape, (10, 8))
 
+    def test_vae_supports_128_heightmaps(self) -> None:
+        generator = PCGIslandGenerator(map_size=128)
+        heightmaps = np.stack(
+            [
+                generator.generate_heightmap(generator.sample_random_params(np.random.default_rng(seed)))
+                for seed in range(2)
+            ],
+            axis=0,
+        )
+        batch = torch.from_numpy(heightmaps).unsqueeze(1)
+        vae = BetaVAE(map_size=128, latent_dim=128)
+
+        reconstruction, mu, logvar, structure_prediction = vae(batch)
+
+        self.assertEqual(reconstruction.shape, batch.shape)
+        self.assertEqual(mu.shape, (2, 128))
+        self.assertEqual(logvar.shape, (2, 128))
+        self.assertIsNone(structure_prediction)
+
     def test_cmaes_baseline_runs_in_normalized_space(self) -> None:
         optimizer = CMAESOptimizer(
             param_ranges=self.generator.get_param_ranges(64),

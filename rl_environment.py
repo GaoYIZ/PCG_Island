@@ -23,7 +23,7 @@ class IslandGenerationEnv(gym.Env):
 
     def __init__(
         self,
-        map_size: int = 64,
+        map_size: int = 128,
         max_steps: int = 50,
         vae_model: Optional[Any] = None,
         feature_normalizer: Optional[IslandFeatureNormalizer] = None,
@@ -167,7 +167,7 @@ class IslandGenerationEnv(gym.Env):
 
 
 if __name__ == "__main__":
-    env = IslandGenerationEnv(map_size=64, max_steps=5)
+    env = IslandGenerationEnv(map_size=128, max_steps=5)
     state, info = env.reset(seed=42)
     print(f"State shape: {state.shape}")
     print(f"Initial score: {info['score']['total_score']:.4f}")

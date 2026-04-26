@@ -32,7 +32,7 @@ class IslandDatasetBuilder:
 
     def __init__(
         self,
-        map_size: int = 64,
+        map_size: int = 128,
         scorer: Optional[MapScorer] = None,
         sampling_profile: str = "island",
     ):

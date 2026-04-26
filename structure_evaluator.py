@@ -33,7 +33,7 @@ class StructureEvaluator:
 
     def __init__(
         self,
-        map_size: int = 64,
+        map_size: int = 128,
         water_threshold: float = 0.30,
         slope_threshold: float = 30.0,
         height_scale: float = 3.5,
@@ -249,8 +249,8 @@ class StructureEvaluator:
 if __name__ == "__main__":
     from pcg_generator import PCGIslandGenerator
 
-    generator = PCGIslandGenerator(map_size=64)
-    evaluator = StructureEvaluator(map_size=64)
+    generator = PCGIslandGenerator(map_size=128)
+    evaluator = StructureEvaluator(map_size=128)
     heightmap = generator.generate_heightmap(generator.sample_random_params(np.random.default_rng(42)))
     metrics = evaluator.evaluate(heightmap)
     print("Structure metrics:")

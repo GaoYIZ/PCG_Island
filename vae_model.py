@@ -14,12 +14,12 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class BetaVAE(nn.Module):
-    """Beta-VAE with KL warmup and edge-aware reconstruction for 64x64 heightmaps."""
+    """Beta-VAE with KL warmup and edge-aware reconstruction for square heightmaps."""
 
     def __init__(
         self,
-        map_size: int = 64,
-        latent_dim: int = 32,
+        map_size: int = 128,
+        latent_dim: int = 128,
         beta: float = 0.25,
         beta_start: float = 0.0,
         free_bits: float = 0.01,
@@ -33,10 +33,12 @@ class BetaVAE(nn.Module):
         coast_recon_focus_weight: float = 2.0,
     ):
         super().__init__()
-        if map_size != 64:
-            raise ValueError("This reference implementation currently supports map_size=64.")
+        if map_size % 16 != 0:
+            raise ValueError("This reference implementation requires map_size to be divisible by 16.")
 
         self.map_size = map_size
+        self.encoder_output_size = map_size // 16
+        self.encoder_channels = 256
         self.latent_dim = latent_dim
         self.beta = float(beta)
         self.beta_start = float(beta_start)
@@ -62,12 +64,13 @@ class BetaVAE(nn.Module):
             nn.ReLU(inplace=True),
             nn.Flatten(),
         )
-        self.fc_mu = nn.Linear(256 * 4 * 4, latent_dim)
-        self.fc_logvar = nn.Linear(256 * 4 * 4, latent_dim)
+        flattened_dim = self.encoder_channels * self.encoder_output_size * self.encoder_output_size
+        self.fc_mu = nn.Linear(flattened_dim, latent_dim)
+        self.fc_logvar = nn.Linear(flattened_dim, latent_dim)
 
-        self.decoder_input = nn.Linear(latent_dim, 256 * 4 * 4)
+        self.decoder_input = nn.Linear(latent_dim, flattened_dim)
         self.decoder = nn.Sequential(
-            nn.Unflatten(1, (256, 4, 4)),
+            nn.Unflatten(1, (self.encoder_channels, self.encoder_output_size, self.encoder_output_size)),
             nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
@@ -378,7 +381,7 @@ def encode_heightmaps(
 if __name__ == "__main__":
     from pcg_generator import PCGIslandGenerator
 
-    generator = PCGIslandGenerator(map_size=64)
+    generator = PCGIslandGenerator(map_size=128)
     heightmaps = np.stack(
         [generator.generate_heightmap(generator.sample_random_params(np.random.default_rng(i))) for i in range(32)],
         axis=0,
@@ -386,7 +389,7 @@ if __name__ == "__main__":
     dataset = HeightmapDataset(heightmaps)
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
 
-    vae = BetaVAE(map_size=64, latent_dim=16, beta=0.25, beta_start=0.0, free_bits=0.01)
+    vae = BetaVAE(map_size=128, latent_dim=128, beta=0.25, beta_start=0.0, free_bits=0.01)
     history = train_vae(vae, dataloader, epochs=2, warmup_epochs=1)
     latents = encode_heightmaps(vae, heightmaps, batch_size=8)
     print(f"Training steps: {len(history)}")

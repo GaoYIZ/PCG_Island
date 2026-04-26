@@ -23,7 +23,8 @@ COAST_THRESHOLD = 0.30
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optuna 调优 IslandTest 的 VAE")
     parser.add_argument("--output-dir", type=str, default="optuna_vae_outputs", help="调参输出目录")
-    parser.add_argument("--map-size", type=int, default=64, help="地图尺寸")
+    parser.add_argument("--map-size", type=int, default=128, help="地图尺寸")
+    parser.add_argument("--latent-dim", type=int, default=128, help="固定的 VAE latent 维度")
     parser.add_argument("--dataset-samples", type=int, default=120, help="每轮数据采样量")
     parser.add_argument("--min-clean-samples", type=int, default=64, help="最少保留样本数")
     parser.add_argument("--max-dataset-samples", type=int, default=480, help="最大原始样本数")
@@ -143,7 +144,6 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def objective(trial: optuna.Trial) -> float:
-        latent_dim = trial.suggest_categorical("latent_dim", [8, 12, 16, 24, 32])
         beta = trial.suggest_float("beta", 0.05, 0.5, log=True)
         beta_start = trial.suggest_float("beta_start", 0.0, 0.08)
         free_bits = trial.suggest_float("free_bits", 0.001, 0.05, log=True)
@@ -160,7 +160,7 @@ def main() -> None:
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
         vae = BetaVAE(
             map_size=args.map_size,
-            latent_dim=latent_dim,
+            latent_dim=args.latent_dim,
             beta=beta,
             beta_start=beta_start,
             free_bits=free_bits,
@@ -193,9 +193,9 @@ def main() -> None:
         structure_mae = float(np.mean(np.abs(val_metrics - predictions))) if predictions.size else 0.0
         final_kl = float(history[-1]["kl_loss"]) if history else 0.0
         latent_global_std = float(latents.std()) if len(latents) > 0 else 0.0
-        latent_std_per_dim = latents.std(axis=0) if len(latents) > 0 else np.zeros((latent_dim,), dtype=np.float32)
+        latent_std_per_dim = latents.std(axis=0) if len(latents) > 0 else np.zeros((args.latent_dim,), dtype=np.float32)
         active_threshold = max(1e-3, latent_global_std * 0.02)
-        active_ratio = float(np.mean(latent_std_per_dim > active_threshold)) if latent_dim > 0 else 0.0
+        active_ratio = float(np.mean(latent_std_per_dim > active_threshold)) if args.latent_dim > 0 else 0.0
         collapse_penalty = max(0.0, 0.35 - active_ratio)
         objective_value = (
             0.30 * pixel_mae
@@ -224,6 +224,7 @@ def main() -> None:
         "best_params": study.best_trial.params,
         "best_attrs": study.best_trial.user_attrs,
     }
+    best["best_params"]["latent_dim"] = args.latent_dim
     (output_dir / "best_trial.json").write_text(json.dumps(best, ensure_ascii=False, indent=2), encoding="utf-8")
     print("最优结果已保存到:", output_dir / "best_trial.json")
     print(json.dumps(best, ensure_ascii=False, indent=2))
