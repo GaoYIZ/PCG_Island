@@ -252,15 +252,48 @@ def reconstruct_heightmaps(
     heightmaps: np.ndarray,
     batch_size: int,
     device: torch.device,
+    deterministic: bool = True,
 ) -> np.ndarray:
     vae.eval()
     batches: List[np.ndarray] = []
     with torch.no_grad():
         for start in range(0, len(heightmaps), batch_size):
             batch = torch.as_tensor(heightmaps[start : start + batch_size], dtype=torch.float32, device=device)
-            reconstruction, _, _, _ = vae(batch.unsqueeze(1))
+            inputs = batch.unsqueeze(1)
+            if deterministic:
+                mu, _ = vae.encode(inputs)
+                reconstruction = vae.decode(mu)
+            else:
+                reconstruction, _, _, _ = vae(inputs)
             batches.append(reconstruction.squeeze(1).cpu().numpy())
     return np.concatenate(batches, axis=0) if batches else np.empty_like(heightmaps)
+
+
+def build_focus_masks(
+    heightmaps: np.ndarray,
+    water_threshold: float = COAST_THRESHOLD,
+) -> Tuple[np.ndarray, np.ndarray]:
+    land_mask = heightmaps > water_threshold
+    padded = np.pad(land_mask, ((0, 0), (1, 1), (1, 1)), mode="edge")
+    up = padded[:, :-2, 1:-1]
+    down = padded[:, 2:, 1:-1]
+    left = padded[:, 1:-1, :-2]
+    right = padded[:, 1:-1, 2:]
+    coast_band = land_mask != up
+    coast_band |= land_mask != down
+    coast_band |= land_mask != left
+    coast_band |= land_mask != right
+    return land_mask, coast_band
+
+
+def masked_mae(
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    mask: np.ndarray,
+) -> float:
+    if mask.size == 0 or not np.any(mask):
+        return 0.0
+    return float(np.mean(np.abs(original[mask] - reconstructed[mask])))
 
 
 def predict_structure_targets(
@@ -438,10 +471,17 @@ def evaluate_vae_representation(
 ) -> Dict[str, object]:
     print_section("第四阶段：VAE 表征有效性评估")
 
-    reconstructions = reconstruct_heightmaps(vae, arrays["heightmaps"], args.batch_size, device)
+    reconstructions = reconstruct_heightmaps(
+        vae,
+        arrays["heightmaps"],
+        args.batch_size,
+        device,
+        deterministic=True,
+    )
     original_metrics = arrays["metric_matrix"]
     core_metric_names = tuple(builder.evaluator.core_metric_names)
     core_original_metrics = arrays["core_metric_matrix"]
+    land_mask, coast_band = build_focus_masks(arrays["heightmaps"])
     reconstructed_metrics = np.array(
         [
             [builder.evaluator.evaluate(heightmap)[name] for name in builder.evaluator.metric_names]
@@ -453,6 +493,8 @@ def evaluate_vae_representation(
 
     pixel_mse = float(np.mean((arrays["heightmaps"] - reconstructions) ** 2))
     pixel_mae = float(np.mean(np.abs(arrays["heightmaps"] - reconstructions)))
+    land_pixel_mae = masked_mae(arrays["heightmaps"], reconstructions, land_mask)
+    coast_band_mae = masked_mae(arrays["heightmaps"], reconstructions, coast_band)
     metric_mae = {
         name: float(np.mean(np.abs(original_metrics[:, idx] - reconstructed_metrics[:, idx])))
         for idx, name in enumerate(builder.evaluator.metric_names)
@@ -528,8 +570,11 @@ def evaluate_vae_representation(
     )
 
     summary = {
+        "reconstruction_mode": "deterministic_mu_decode",
         "pixel_mse": pixel_mse,
         "pixel_mae": pixel_mae,
+        "land_pixel_mae": land_pixel_mae,
+        "coast_band_mae": coast_band_mae,
         "metric_reconstruction_mae": metric_mae,
         "metric_reconstruction_correlation": metric_corr,
         "structure_head_mae": structure_head_mae,
@@ -542,8 +587,11 @@ def evaluate_vae_representation(
         "latent_predictive_r2": predictive_r2,
     }
 
+    print("重建评估模式        : deterministic_mu_decode")
     print(f"像素级 MSE          : {pixel_mse:.6f}")
     print(f"像素级 MAE          : {pixel_mae:.6f}")
+    print(f"陆地区域 MAE        : {land_pixel_mae:.6f}")
+    print(f"海岸带 MAE          : {coast_band_mae:.6f}")
     print(f"活跃 latent 维度    : {active_dims} / {latents.shape[1]}")
     print("\n重建后结构指标 MAE:")
     print_metric_dict(metric_mae, precision=4)

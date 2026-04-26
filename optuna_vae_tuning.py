@@ -17,6 +17,8 @@ from torch.utils.data import DataLoader
 from dataset_pipeline import IslandDatasetBuilder
 from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
 
+COAST_THRESHOLD = 0.30
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optuna 调优 IslandTest 的 VAE")
@@ -61,15 +63,53 @@ def build_arrays(args: argparse.Namespace) -> dict[str, np.ndarray]:
     return builder.build_training_arrays(clean_samples)
 
 
-def reconstruct(vae: BetaVAE, heightmaps: np.ndarray, batch_size: int, device: torch.device) -> np.ndarray:
+def reconstruct(
+    vae: BetaVAE,
+    heightmaps: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+    deterministic: bool = True,
+) -> np.ndarray:
     vae.eval()
     outputs: list[np.ndarray] = []
     with torch.no_grad():
         for start in range(0, len(heightmaps), batch_size):
             batch = torch.as_tensor(heightmaps[start : start + batch_size], dtype=torch.float32, device=device)
-            recon, _, _, _ = vae(batch.unsqueeze(1))
+            inputs = batch.unsqueeze(1)
+            if deterministic:
+                mu, _ = vae.encode(inputs)
+                recon = vae.decode(mu)
+            else:
+                recon, _, _, _ = vae(inputs)
             outputs.append(recon.squeeze(1).cpu().numpy())
     return np.concatenate(outputs, axis=0)
+
+
+def build_focus_masks(
+    heightmaps: np.ndarray,
+    water_threshold: float = COAST_THRESHOLD,
+) -> tuple[np.ndarray, np.ndarray]:
+    land_mask = heightmaps > water_threshold
+    padded = np.pad(land_mask, ((0, 0), (1, 1), (1, 1)), mode="edge")
+    up = padded[:, :-2, 1:-1]
+    down = padded[:, 2:, 1:-1]
+    left = padded[:, 1:-1, :-2]
+    right = padded[:, 1:-1, 2:]
+    coast_band = land_mask != up
+    coast_band |= land_mask != down
+    coast_band |= land_mask != left
+    coast_band |= land_mask != right
+    return land_mask, coast_band
+
+
+def masked_mae(
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    mask: np.ndarray,
+) -> float:
+    if mask.size == 0 or not np.any(mask):
+        return 0.0
+    return float(np.mean(np.abs(original[mask] - reconstructed[mask])))
 
 
 def predict_structure(vae: BetaVAE, heightmaps: np.ndarray, batch_size: int, device: torch.device) -> np.ndarray:
@@ -146,6 +186,10 @@ def main() -> None:
         latents = encode_heightmaps(vae, val_heightmaps, batch_size=args.batch_size, device=str(device))
 
         pixel_mse = float(np.mean((val_heightmaps - reconstructions) ** 2))
+        pixel_mae = float(np.mean(np.abs(val_heightmaps - reconstructions)))
+        land_mask, coast_band = build_focus_masks(val_heightmaps)
+        land_mae = masked_mae(val_heightmaps, reconstructions, land_mask)
+        coast_band_mae = masked_mae(val_heightmaps, reconstructions, coast_band)
         structure_mae = float(np.mean(np.abs(val_metrics - predictions))) if predictions.size else 0.0
         final_kl = float(history[-1]["kl_loss"]) if history else 0.0
         latent_global_std = float(latents.std()) if len(latents) > 0 else 0.0
@@ -153,9 +197,19 @@ def main() -> None:
         active_threshold = max(1e-3, latent_global_std * 0.02)
         active_ratio = float(np.mean(latent_std_per_dim > active_threshold)) if latent_dim > 0 else 0.0
         collapse_penalty = max(0.0, 0.35 - active_ratio)
-        objective_value = pixel_mse + 0.55 * structure_mae + 0.08 * final_kl + 0.40 * collapse_penalty
+        objective_value = (
+            0.30 * pixel_mae
+            + 0.20 * land_mae
+            + 0.35 * coast_band_mae
+            + 0.45 * structure_mae
+            + 0.08 * final_kl
+            + 0.30 * collapse_penalty
+        )
 
         trial.set_user_attr("pixel_mse", pixel_mse)
+        trial.set_user_attr("pixel_mae", pixel_mae)
+        trial.set_user_attr("land_mae", land_mae)
+        trial.set_user_attr("coast_band_mae", coast_band_mae)
         trial.set_user_attr("structure_mae", structure_mae)
         trial.set_user_attr("final_kl", final_kl)
         trial.set_user_attr("active_ratio", active_ratio)
