@@ -13,6 +13,20 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 
+class ResidualRefineBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(x + self.block(x))
+
+
 class BetaVAE(nn.Module):
     """Beta-VAE with KL warmup and edge-aware reconstruction for square heightmaps."""
 
@@ -27,6 +41,8 @@ class BetaVAE(nn.Module):
         land_threshold: float = 0.30,
         mask_loss_weight: float = 0.15,
         coast_loss_weight: float = 0.20,
+        land_dice_loss_weight: float = 0.10,
+        coast_dice_loss_weight: float = 0.30,
         structure_dim: int = 0,
         structure_loss_weight: float = 0.0,
         land_recon_focus_weight: float = 1.5,
@@ -48,6 +64,8 @@ class BetaVAE(nn.Module):
         self.land_threshold = float(land_threshold)
         self.mask_loss_weight = float(mask_loss_weight)
         self.coast_loss_weight = float(coast_loss_weight)
+        self.land_dice_loss_weight = float(land_dice_loss_weight)
+        self.coast_dice_loss_weight = float(coast_dice_loss_weight)
         self.structure_dim = int(structure_dim)
         self.structure_loss_weight = float(structure_loss_weight)
         self.land_recon_focus_weight = float(land_recon_focus_weight)
@@ -77,7 +95,13 @@ class BetaVAE(nn.Module):
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 1, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.output_head = nn.Sequential(
+            ResidualRefineBlock(16),
+            ResidualRefineBlock(16),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1),
             nn.Sigmoid(),
         )
         if self.structure_dim > 0:
@@ -112,7 +136,8 @@ class BetaVAE(nn.Module):
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         hidden = self.decoder_input(z)
-        return self.decoder(hidden)
+        decoded = self.decoder(hidden)
+        return self.output_head(decoded)
 
     def predict_structure(self, latent: torch.Tensor) -> torch.Tensor | None:
         if self.structure_predictor is None:
@@ -145,6 +170,14 @@ class BetaVAE(nn.Module):
     def _weighted_mean(loss_map: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         return torch.sum(loss_map * weights) / torch.sum(weights)
 
+    @staticmethod
+    def _dice_loss(prediction: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        dims = tuple(range(1, prediction.ndim))
+        intersection = torch.sum(prediction * target, dim=dims)
+        denominator = torch.sum(prediction, dim=dims) + torch.sum(target, dim=dims)
+        dice = (2.0 * intersection + eps) / (denominator + eps)
+        return 1.0 - dice.mean()
+
     def loss_function(
         self,
         reconstruction: torch.Tensor,
@@ -172,18 +205,22 @@ class BetaVAE(nn.Module):
 
         recon_land_mask = self._soft_land_mask(reconstruction)
         mask_loss = F.l1_loss(recon_land_mask, target_land_mask, reduction="mean")
+        land_dice_loss = self._dice_loss(recon_land_mask, target_land_mask)
 
         recon_coast = self._coast_response(recon_land_mask)
         coast_loss = F.l1_loss(recon_coast, target_coast, reduction="mean")
+        coast_dice_loss = self._dice_loss(recon_coast, target_coast)
 
         recon_loss = (
-            0.35 * mse_loss
-            + 0.15 * l1_loss
-            + 0.35 * weighted_mse_loss
-            + 0.15 * weighted_l1_loss
+            0.20 * mse_loss
+            + 0.10 * l1_loss
+            + 0.40 * weighted_mse_loss
+            + 0.30 * weighted_l1_loss
             + self.gradient_loss_weight * gradient_loss
             + self.mask_loss_weight * mask_loss
             + self.coast_loss_weight * coast_loss
+            + self.land_dice_loss_weight * land_dice_loss
+            + self.coast_dice_loss_weight * coast_dice_loss
         )
 
         kl_per_dim = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp(), dim=0)
@@ -206,7 +243,9 @@ class BetaVAE(nn.Module):
             "weighted_l1_loss": weighted_l1_loss,
             "gradient_loss": gradient_loss,
             "mask_loss": mask_loss,
+            "land_dice_loss": land_dice_loss,
             "coast_loss": coast_loss,
+            "coast_dice_loss": coast_dice_loss,
             "structure_loss": structure_loss,
             "kl_divergence": kl_divergence,
             "kl_raw": torch.mean(kl_per_dim),
@@ -278,7 +317,9 @@ def train_vae(
         l1_loss = 0.0
         gradient_loss = 0.0
         mask_loss = 0.0
+        land_dice_loss = 0.0
         coast_loss = 0.0
+        coast_dice_loss = 0.0
         weighted_mse_loss = 0.0
         weighted_l1_loss = 0.0
         structure_loss = 0.0
@@ -315,7 +356,9 @@ def train_vae(
             weighted_l1_loss += float(losses["weighted_l1_loss"].item())
             gradient_loss += float(losses["gradient_loss"].item())
             mask_loss += float(losses["mask_loss"].item())
+            land_dice_loss += float(losses["land_dice_loss"].item())
             coast_loss += float(losses["coast_loss"].item())
+            coast_dice_loss += float(losses["coast_dice_loss"].item())
             structure_loss += float(losses["structure_loss"].item())
             kl_loss += float(losses["kl_divergence"].item())
             kl_raw += float(losses["kl_raw"].item())
@@ -332,7 +375,9 @@ def train_vae(
             "weighted_l1_loss": weighted_l1_loss / max(num_batches, 1),
             "gradient_loss": gradient_loss / max(num_batches, 1),
             "mask_loss": mask_loss / max(num_batches, 1),
+            "land_dice_loss": land_dice_loss / max(num_batches, 1),
             "coast_loss": coast_loss / max(num_batches, 1),
+            "coast_dice_loss": coast_dice_loss / max(num_batches, 1),
             "structure_loss": structure_loss / max(num_batches, 1),
             "kl_loss": kl_loss / max(num_batches, 1),
             "kl_raw": kl_raw / max(num_batches, 1),
@@ -348,6 +393,7 @@ def train_vae(
                 f"wmse={epoch_metrics['weighted_mse_loss']:.4f} "
                 f"grad={epoch_metrics['gradient_loss']:.4f} "
                 f"coast={epoch_metrics['coast_loss']:.4f} "
+                f"coast_dice={epoch_metrics['coast_dice_loss']:.4f} "
                 f"struct={epoch_metrics['structure_loss']:.4f} "
                 f"kl={epoch_metrics['kl_loss']:.4f}"
             )

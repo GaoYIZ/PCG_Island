@@ -147,12 +147,14 @@ def main() -> None:
         beta = trial.suggest_float("beta", 0.05, 0.5, log=True)
         beta_start = trial.suggest_float("beta_start", 0.0, 0.08)
         free_bits = trial.suggest_float("free_bits", 0.001, 0.05, log=True)
-        gradient_loss_weight = trial.suggest_float("gradient_loss_weight", 0.05, 0.40)
-        mask_loss_weight = trial.suggest_float("mask_loss_weight", 0.05, 0.35)
-        coast_loss_weight = trial.suggest_float("coast_loss_weight", 0.05, 0.35)
-        structure_loss_weight = trial.suggest_float("structure_loss_weight", 0.15, 0.80)
-        land_recon_focus_weight = trial.suggest_float("land_recon_focus_weight", 0.8, 2.5)
-        coast_recon_focus_weight = trial.suggest_float("coast_recon_focus_weight", 1.0, 3.5)
+        gradient_loss_weight = trial.suggest_float("gradient_loss_weight", 0.15, 0.45)
+        mask_loss_weight = trial.suggest_float("mask_loss_weight", 0.04, 0.22)
+        coast_loss_weight = trial.suggest_float("coast_loss_weight", 0.15, 0.45)
+        land_dice_loss_weight = trial.suggest_float("land_dice_loss_weight", 0.05, 0.30)
+        coast_dice_loss_weight = trial.suggest_float("coast_dice_loss_weight", 0.15, 0.50)
+        structure_loss_weight = trial.suggest_float("structure_loss_weight", 0.04, 0.30)
+        land_recon_focus_weight = trial.suggest_float("land_recon_focus_weight", 1.2, 3.5)
+        coast_recon_focus_weight = trial.suggest_float("coast_recon_focus_weight", 2.0, 5.5)
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 2e-3, log=True)
         warmup_epochs = trial.suggest_int("warmup_epochs", 4, max(args.epochs, 4))
 
@@ -167,6 +169,8 @@ def main() -> None:
             gradient_loss_weight=gradient_loss_weight,
             mask_loss_weight=mask_loss_weight,
             coast_loss_weight=coast_loss_weight,
+            land_dice_loss_weight=land_dice_loss_weight,
+            coast_dice_loss_weight=coast_dice_loss_weight,
             structure_dim=train_metrics.shape[1],
             structure_loss_weight=structure_loss_weight,
             land_recon_focus_weight=land_recon_focus_weight,
@@ -198,12 +202,12 @@ def main() -> None:
         active_ratio = float(np.mean(latent_std_per_dim > active_threshold)) if args.latent_dim > 0 else 0.0
         collapse_penalty = max(0.0, 0.35 - active_ratio)
         objective_value = (
-            0.30 * pixel_mae
-            + 0.20 * land_mae
-            + 0.35 * coast_band_mae
-            + 0.45 * structure_mae
+            0.12 * pixel_mae
+            + 0.30 * land_mae
+            + 0.48 * coast_band_mae
+            + 0.15 * structure_mae
             + 0.08 * final_kl
-            + 0.30 * collapse_penalty
+            + 0.10 * collapse_penalty
         )
 
         trial.set_user_attr("pixel_mse", pixel_mse)

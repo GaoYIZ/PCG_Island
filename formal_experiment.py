@@ -63,10 +63,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-free-bits", type=float, default=0.01, help="每个 latent 维度的最小 KL")
     parser.add_argument("--vae-gradient-loss-weight", type=float, default=0.20, help="边界/梯度重建损失权重")
     parser.add_argument("--vae-mask-loss-weight", type=float, default=0.15, help="陆地掩码重建损失权重")
-    parser.add_argument("--vae-coast-loss-weight", type=float, default=0.20, help="海岸线重建损失权重")
-    parser.add_argument("--vae-structure-loss-weight", type=float, default=0.20, help="结构指标监督损失权重")
-    parser.add_argument("--vae-land-recon-focus-weight", type=float, default=1.5, help="陆地区域重建聚焦权重")
-    parser.add_argument("--vae-coast-recon-focus-weight", type=float, default=2.0, help="海岸带重建聚焦权重")
+    parser.add_argument("--vae-coast-loss-weight", type=float, default=0.28, help="海岸线重建损失权重")
+    parser.add_argument("--vae-land-dice-loss-weight", type=float, default=0.12, help="陆地区域 Dice 重建损失权重")
+    parser.add_argument("--vae-coast-dice-loss-weight", type=float, default=0.32, help="海岸带 Dice 重建损失权重")
+    parser.add_argument("--vae-structure-loss-weight", type=float, default=0.12, help="结构指标监督损失权重")
+    parser.add_argument("--vae-land-recon-focus-weight", type=float, default=2.0, help="陆地区域重建聚焦权重")
+    parser.add_argument("--vae-coast-recon-focus-weight", type=float, default=3.2, help="海岸带重建聚焦权重")
     parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE 学习率")
     parser.add_argument("--ppo-episodes", type=int, default=60, help="PPO 训练轮数")
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="PPO 单轮最大步数")
@@ -399,6 +401,8 @@ def train_formal_vae(
         gradient_loss_weight=args.vae_gradient_loss_weight,
         mask_loss_weight=args.vae_mask_loss_weight,
         coast_loss_weight=args.vae_coast_loss_weight,
+        land_dice_loss_weight=args.vae_land_dice_loss_weight,
+        coast_dice_loss_weight=args.vae_coast_dice_loss_weight,
         structure_dim=arrays["core_metric_matrix"].shape[1],
         structure_loss_weight=args.vae_structure_loss_weight,
         land_recon_focus_weight=args.vae_land_recon_focus_weight,
@@ -448,6 +452,8 @@ def train_formal_vae(
                 "gradient_loss_weight": args.vae_gradient_loss_weight,
                 "mask_loss_weight": args.vae_mask_loss_weight,
                 "coast_loss_weight": args.vae_coast_loss_weight,
+                "land_dice_loss_weight": args.vae_land_dice_loss_weight,
+                "coast_dice_loss_weight": args.vae_coast_dice_loss_weight,
                 "structure_loss_weight": args.vae_structure_loss_weight,
                 "land_recon_focus_weight": args.vae_land_recon_focus_weight,
                 "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
