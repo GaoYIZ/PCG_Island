@@ -171,3 +171,32 @@ class IslandFeatureNormalizer:
             features.append(self.transform_latent(latent_vector))
         features.append(metric_features)
         return np.concatenate(features).astype(np.float32)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "metric_names": list(self.metric_names),
+            "clip": float(self.clip),
+            "metric_mean": None if self.metric_stat_normalizer.mean is None else self.metric_stat_normalizer.mean.tolist(),
+            "metric_std": None if self.metric_stat_normalizer.std is None else self.metric_stat_normalizer.std.tolist(),
+            "latent_mean": None if self.latent_normalizer.mean is None else self.latent_normalizer.mean.tolist(),
+            "latent_std": None if self.latent_normalizer.std is None else self.latent_normalizer.std.tolist(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "IslandFeatureNormalizer":
+        normalizer = cls(
+            metric_names=data["metric_names"],
+            clip=float(data.get("clip", 3.0)),
+        )
+        metric_mean = data.get("metric_mean")
+        metric_std = data.get("metric_std")
+        latent_mean = data.get("latent_mean")
+        latent_std = data.get("latent_std")
+
+        if metric_mean is not None and metric_std is not None:
+            normalizer.metric_stat_normalizer.mean = np.asarray(metric_mean, dtype=np.float32)
+            normalizer.metric_stat_normalizer.std = np.asarray(metric_std, dtype=np.float32)
+        if latent_mean is not None and latent_std is not None:
+            normalizer.latent_normalizer.mean = np.asarray(latent_mean, dtype=np.float32)
+            normalizer.latent_normalizer.std = np.asarray(latent_std, dtype=np.float32)
+        return normalizer

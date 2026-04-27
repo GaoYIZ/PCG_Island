@@ -81,8 +81,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run a full VAE-only evaluation with train/val/test splits and no RL",
     )
+    parser.add_argument(
+        "--formal-rl",
+        action="store_true",
+        help="Run the formal VAE split pipeline first, then train/evaluate RL with the frozen VAE.",
+    )
     parser.add_argument("--vae-train-ratio", type=float, default=0.70, help="Train split ratio for formal VAE-only evaluation")
     parser.add_argument("--vae-val-ratio", type=float, default=0.15, help="Validation split ratio for formal VAE-only evaluation")
+    parser.add_argument(
+        "--optuna-best-trial",
+        type=str,
+        default="",
+        help="Optional path to best_trial.json produced by optuna_vae_tuning.py; overrides VAE hyperparameters.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
 
@@ -102,6 +113,60 @@ def apply_formal_vae_preset(args: argparse.Namespace) -> None:
         args.vae_epochs = 50
     if args.batch_size == 32:
         args.batch_size = 16
+
+
+def apply_formal_rl_preset(args: argparse.Namespace) -> None:
+    if not args.formal_rl:
+        return
+
+    args.skip_rl = False
+    if args.dataset_samples == 120:
+        args.dataset_samples = 500
+    if args.min_clean_samples == 48:
+        args.min_clean_samples = 500
+    if args.max_dataset_samples == 480:
+        args.max_dataset_samples = 2000
+    if args.vae_epochs == 30:
+        args.vae_epochs = 50
+    if args.batch_size == 32:
+        args.batch_size = 16
+    if args.sac_episodes == 0:
+        args.sac_episodes = 80
+    if args.eval_islands == 12:
+        args.eval_islands = 24
+
+
+def apply_optuna_best_trial(args: argparse.Namespace) -> None:
+    if not args.optuna_best_trial:
+        return
+
+    import json
+
+    trial_path = Path(args.optuna_best_trial)
+    if not trial_path.exists():
+        raise FileNotFoundError(f"Optuna best trial file not found: {trial_path}")
+
+    trial_data = json.loads(trial_path.read_text(encoding="utf-8"))
+    best_params = trial_data.get("best_params", {})
+    mapping = {
+        "latent_dim": "latent_dim",
+        "beta": "vae_beta",
+        "beta_start": "vae_beta_start",
+        "warmup_epochs": "vae_warmup_epochs",
+        "free_bits": "vae_free_bits",
+        "gradient_loss_weight": "vae_gradient_loss_weight",
+        "mask_loss_weight": "vae_mask_loss_weight",
+        "coast_loss_weight": "vae_coast_loss_weight",
+        "land_dice_loss_weight": "vae_land_dice_loss_weight",
+        "coast_dice_loss_weight": "vae_coast_dice_loss_weight",
+        "structure_loss_weight": "vae_structure_loss_weight",
+        "land_recon_focus_weight": "vae_land_recon_focus_weight",
+        "coast_recon_focus_weight": "vae_coast_recon_focus_weight",
+        "learning_rate": "vae_lr",
+    }
+    for source_name, target_name in mapping.items():
+        if source_name in best_params:
+            setattr(args, target_name, best_params[source_name])
 
 
 def split_indices(
@@ -679,7 +744,39 @@ def evaluate_vae_representation(
     return summary
 
 
-def run_formal_vae_only_evaluation(
+def save_trained_vae_artifacts(
+    args: argparse.Namespace,
+    vae: BetaVAE,
+    feature_normalizer: IslandFeatureNormalizer,
+    output_dir: Path,
+) -> None:
+    artifact_dir = output_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": vae.state_dict(),
+            "map_size": args.map_size,
+            "latent_dim": args.latent_dim,
+            "vae_config": {
+                "beta": args.vae_beta,
+                "beta_start": args.vae_beta_start,
+                "free_bits": args.vae_free_bits,
+                "gradient_loss_weight": args.vae_gradient_loss_weight,
+                "mask_loss_weight": args.vae_mask_loss_weight,
+                "coast_loss_weight": args.vae_coast_loss_weight,
+                "land_dice_loss_weight": args.vae_land_dice_loss_weight,
+                "coast_dice_loss_weight": args.vae_coast_dice_loss_weight,
+                "structure_loss_weight": args.vae_structure_loss_weight,
+                "land_recon_focus_weight": args.vae_land_recon_focus_weight,
+                "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
+            },
+        },
+        artifact_dir / "vae_checkpoint.pt",
+    )
+    save_json(feature_normalizer.to_dict(), artifact_dir / "feature_normalizer.json")
+
+
+def run_formal_vae_pipeline(
     args: argparse.Namespace,
     builder: IslandDatasetBuilder,
     clean_samples: List,
@@ -708,6 +805,11 @@ def run_formal_vae_only_evaluation(
     train_dir = output_dir / "train_split"
     train_dir.mkdir(parents=True, exist_ok=True)
     vae, train_latents, history = train_formal_vae(args, split_arrays_map["train"], train_dir, device)
+    feature_normalizer = builder.fit_feature_normalizer(
+        split_clean_samples["train"],
+        latent_matrix=train_latents,
+    )
+    save_trained_vae_artifacts(args, vae, feature_normalizer, output_dir)
 
     split_summaries: Dict[str, Dict[str, object]] = {}
     split_latents: Dict[str, np.ndarray] = {"train": train_latents}
@@ -786,7 +888,33 @@ def run_formal_vae_only_evaluation(
         "train_history_epochs": len(history),
     }
     save_json(final_summary, output_dir / "final_summary.json")
-    return final_summary
+    return {
+        "vae": vae,
+        "train_latents": train_latents,
+        "feature_normalizer": feature_normalizer,
+        "history": history,
+        "split_summaries": split_summaries,
+        "final_summary": final_summary,
+    }
+
+
+def run_formal_vae_only_evaluation(
+    args: argparse.Namespace,
+    builder: IslandDatasetBuilder,
+    clean_samples: List,
+    arrays: Dict[str, np.ndarray],
+    output_dir: Path,
+    device: torch.device,
+) -> Dict[str, object]:
+    pipeline = run_formal_vae_pipeline(
+        args=args,
+        builder=builder,
+        clean_samples=clean_samples,
+        arrays=arrays,
+        output_dir=output_dir,
+        device=device,
+    )
+    return pipeline["final_summary"]
 
 
 def build_env_factory(
@@ -805,6 +933,74 @@ def build_env_factory(
         )
 
     return factory
+
+
+def run_formal_rl_experiment(
+    args: argparse.Namespace,
+    builder: IslandDatasetBuilder,
+    clean_samples: List,
+    arrays: Dict[str, np.ndarray],
+    output_dir: Path,
+    device: torch.device,
+) -> Dict[str, object]:
+    pipeline = run_formal_vae_pipeline(
+        args=args,
+        builder=builder,
+        clean_samples=clean_samples,
+        arrays=arrays,
+        output_dir=output_dir,
+        device=device,
+    )
+    vae = pipeline["vae"]
+    feature_normalizer = pipeline["feature_normalizer"]
+    vae_summary = pipeline["final_summary"]
+
+    env_factory = build_env_factory(args, vae, feature_normalizer)
+    zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
+    random_policy = RandomPolicy(action_dim=len(builder.param_normalizer.param_names), seed=args.seed + 3000)
+    zero_summary = evaluate_agent("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
+    random_summary = evaluate_agent("Random", random_policy, env_factory, output_dir, args.eval_islands, args.seed + 1500)
+
+    ppo_agent, _, _ = train_ppo(args, env_factory, output_dir, device)
+    ppo_summary = evaluate_agent("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000)
+
+    sac_summary = None
+    if args.sac_episodes > 0:
+        sac_agent, _ = train_sac(args, env_factory, output_dir, device)
+        sac_summary = evaluate_agent("SAC", sac_agent, env_factory, output_dir, args.eval_islands, args.seed + 4000)
+
+    policy_summaries = {
+        "Zero": zero_summary,
+        "Random": random_summary,
+        "PPO": ppo_summary,
+    }
+    if sac_summary is not None:
+        policy_summaries["SAC"] = sac_summary
+
+    final_summary: Dict[str, object] = {
+        "mode": "formal_rl",
+        "vae_pipeline_summary": vae_summary,
+        "state_definition": {
+            "components": ["theta_norm", "z_norm", "metrics_norm"],
+            "param_dim": len(builder.param_normalizer.param_names),
+            "latent_dim": int(vae.latent_dim),
+            "metric_dim": len(builder.evaluator.metric_names),
+            "state_dim": len(builder.param_normalizer.param_names) + int(vae.latent_dim) + len(builder.evaluator.metric_names),
+            "action": "delta_theta_norm",
+        },
+        "reward_definition": builder.scorer.describe(),
+        "policy_comparison": compare_policy_summaries(policy_summaries),
+        "zero_summary": zero_summary,
+        "random_summary": random_summary,
+        "ppo_summary": ppo_summary,
+    }
+    if sac_summary is not None:
+        final_summary["sac_summary"] = sac_summary
+
+    save_json(vae_summary, output_dir / "vae_final_summary.json")
+    save_json(final_summary, output_dir / "final_summary.json")
+    save_json(final_summary["policy_comparison"], output_dir / "policy_comparison.json")
+    return final_summary
 
 
 def train_ppo(
@@ -1049,6 +1245,8 @@ def compare_policy_summaries(policy_summaries: Dict[str, Dict[str, object]]) -> 
 def main() -> None:
     args = parse_args()
     apply_formal_vae_preset(args)
+    apply_formal_rl_preset(args)
+    apply_optuna_best_trial(args)
     set_seed(args.seed)
     configure_matplotlib_chinese()
 
@@ -1067,6 +1265,9 @@ def main() -> None:
     print(f"PPO ??????        : {args.ppo_episodes}")
     print(f"SAC ??????        : {args.sac_episodes}")
     print(f"??? VAE-only ???   : {args.formal_vae_only}")
+    print(f"??? formal RL ???  : {args.formal_rl}")
+    if args.optuna_best_trial:
+        print(f"Optuna ??????     : {Path(args.optuna_best_trial).resolve()}")
 
     builder, clean_samples, arrays, clean_summary = build_dataset(args, output_dir)
 
@@ -1090,6 +1291,25 @@ def main() -> None:
         print("- train_split|val_split|test_split/vae_reconstruction.png")
         print("- train_split|val_split|test_split/vae_representation_summary.json")
         print("- final_summary.json")
+        return
+
+    if args.formal_rl:
+        final_summary = run_formal_rl_experiment(
+            args=args,
+            builder=builder,
+            clean_samples=clean_samples,
+            arrays=arrays,
+            output_dir=output_dir,
+            device=device,
+        )
+        print_section("??????")
+        print(f"????????????    : {output_dir.resolve()}")
+        print("?????????        : ??? RL + frozen VAE")
+        print("- artifacts/vae_checkpoint.pt / feature_normalizer.json")
+        print("- train_split|val_split|test_split/vae_reconstruction.png")
+        print("- zero/random/ppo/sac_evaluation_summary.json")
+        print("- policy_comparison.json / final_summary.json")
+        print(f"RL ????????      : {final_summary['state_definition']['state_dim']}")
         return
 
     vae, latents, _ = train_formal_vae(args, arrays, output_dir, device)

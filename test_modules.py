@@ -5,6 +5,9 @@ Smoke tests for the IslandTest core pipeline.
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -18,7 +21,7 @@ from pcg_generator import PCGIslandGenerator
 from ppo_baseline import PPOAgent
 from rl_environment import IslandGenerationEnv
 from structure_evaluator import StructureEvaluator
-from formal_experiment import apply_formal_vae_preset, split_indices, subset_arrays
+from formal_experiment import apply_formal_rl_preset, apply_formal_vae_preset, apply_optuna_best_trial, split_indices, subset_arrays
 from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
 
 
@@ -128,6 +131,14 @@ class IslandPipelineTests(unittest.TestCase):
         state = normalizer.transform_state(param_vector=param_vector, metrics=metrics_list[0], latent_vector=latent_matrix[0])
         self.assertTrue(np.all(state <= 1.0 + 1e-6))
         self.assertTrue(np.all(state >= -1.0 - 1e-6))
+
+        restored = IslandFeatureNormalizer.from_dict(normalizer.to_dict())
+        restored_state = restored.transform_state(
+            param_vector=param_vector,
+            metrics=metrics_list[0],
+            latent_vector=latent_matrix[0],
+        )
+        np.testing.assert_allclose(state, restored_state, atol=1e-6)
 
     def test_parameter_normalizer_is_round_trip_safe(self) -> None:
         normalizer = ParameterSpaceNormalizer(self.generator.get_param_ranges(64))
@@ -280,6 +291,90 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertEqual(args.max_dataset_samples, 2000)
         self.assertEqual(args.vae_epochs, 50)
         self.assertEqual(args.batch_size, 16)
+
+    def test_formal_rl_preset_enables_sac_and_real_scale(self) -> None:
+        class Args:
+            formal_rl = True
+            skip_rl = True
+            dataset_samples = 120
+            min_clean_samples = 48
+            max_dataset_samples = 480
+            vae_epochs = 30
+            batch_size = 32
+            sac_episodes = 0
+            eval_islands = 12
+
+        args = Args()
+        apply_formal_rl_preset(args)
+
+        self.assertFalse(args.skip_rl)
+        self.assertEqual(args.dataset_samples, 500)
+        self.assertEqual(args.min_clean_samples, 500)
+        self.assertEqual(args.max_dataset_samples, 2000)
+        self.assertEqual(args.vae_epochs, 50)
+        self.assertEqual(args.batch_size, 16)
+        self.assertEqual(args.sac_episodes, 80)
+        self.assertEqual(args.eval_islands, 24)
+
+    def test_optuna_best_trial_overrides_vae_args(self) -> None:
+        class Args:
+            optuna_best_trial = ""
+            latent_dim = 128
+            vae_beta = 0.25
+            vae_beta_start = 0.0
+            vae_warmup_epochs = 12
+            vae_free_bits = 0.01
+            vae_gradient_loss_weight = 0.20
+            vae_mask_loss_weight = 0.15
+            vae_coast_loss_weight = 0.28
+            vae_land_dice_loss_weight = 0.12
+            vae_coast_dice_loss_weight = 0.32
+            vae_structure_loss_weight = 0.12
+            vae_land_recon_focus_weight = 2.0
+            vae_coast_recon_focus_weight = 3.2
+            vae_lr = 8e-4
+
+        payload = {
+            "best_params": {
+                "latent_dim": 64,
+                "beta": 0.18,
+                "beta_start": 0.01,
+                "warmup_epochs": 5,
+                "free_bits": 0.004,
+                "gradient_loss_weight": 0.31,
+                "mask_loss_weight": 0.08,
+                "coast_loss_weight": 0.33,
+                "land_dice_loss_weight": 0.14,
+                "coast_dice_loss_weight": 0.41,
+                "structure_loss_weight": 0.06,
+                "land_recon_focus_weight": 2.7,
+                "coast_recon_focus_weight": 3.9,
+                "learning_rate": 5e-4,
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trial_path = Path(tmpdir) / "best_trial.json"
+            trial_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            args = Args()
+            args.optuna_best_trial = str(trial_path)
+            apply_optuna_best_trial(args)
+
+        self.assertEqual(args.latent_dim, 64)
+        self.assertAlmostEqual(args.vae_beta, 0.18)
+        self.assertAlmostEqual(args.vae_beta_start, 0.01)
+        self.assertEqual(args.vae_warmup_epochs, 5)
+        self.assertAlmostEqual(args.vae_free_bits, 0.004)
+        self.assertAlmostEqual(args.vae_gradient_loss_weight, 0.31)
+        self.assertAlmostEqual(args.vae_mask_loss_weight, 0.08)
+        self.assertAlmostEqual(args.vae_coast_loss_weight, 0.33)
+        self.assertAlmostEqual(args.vae_land_dice_loss_weight, 0.14)
+        self.assertAlmostEqual(args.vae_coast_dice_loss_weight, 0.41)
+        self.assertAlmostEqual(args.vae_structure_loss_weight, 0.06)
+        self.assertAlmostEqual(args.vae_land_recon_focus_weight, 2.7)
+        self.assertAlmostEqual(args.vae_coast_recon_focus_weight, 3.9)
+        self.assertAlmostEqual(args.vae_lr, 5e-4)
 
     def test_cmaes_baseline_runs_in_normalized_space(self) -> None:
         optimizer = CMAESOptimizer(
