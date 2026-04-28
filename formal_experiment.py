@@ -94,6 +94,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional path to best_trial.json produced by optuna_vae_tuning.py; overrides VAE hyperparameters.",
     )
+    parser.add_argument(
+        "--fast-profile",
+        action="store_true",
+        help="Use a lighter-weight experimental profile for faster Colab iteration, especially with 64x64 maps.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
 
@@ -167,6 +172,52 @@ def apply_optuna_best_trial(args: argparse.Namespace) -> None:
     for source_name, target_name in mapping.items():
         if source_name in best_params:
             setattr(args, target_name, best_params[source_name])
+
+
+def apply_fast_profile(args: argparse.Namespace) -> None:
+    if not args.fast_profile:
+        return
+
+    if args.map_size <= 64:
+        if args.dataset_samples in (120, 500):
+            args.dataset_samples = 240
+        if args.min_clean_samples in (48, 500):
+            args.min_clean_samples = 240
+        if args.max_dataset_samples in (480, 2000):
+            args.max_dataset_samples = 960
+        if args.vae_epochs in (30, 50):
+            args.vae_epochs = 24
+        if args.batch_size in (16, 32):
+            args.batch_size = 32
+        if args.latent_dim == 128:
+            args.latent_dim = 64
+        if args.ppo_episodes == 60:
+            args.ppo_episodes = 36
+        if args.sac_episodes == 80:
+            args.sac_episodes = 40
+        elif args.sac_episodes == 0 and args.formal_rl:
+            args.sac_episodes = 40
+        if args.eval_islands in (12, 24):
+            args.eval_islands = 12
+    else:
+        if args.dataset_samples in (120, 500):
+            args.dataset_samples = 320
+        if args.min_clean_samples in (48, 500):
+            args.min_clean_samples = 320
+        if args.max_dataset_samples in (480, 2000):
+            args.max_dataset_samples = 1280
+        if args.vae_epochs in (30, 50):
+            args.vae_epochs = 30
+        if args.batch_size in (16, 32):
+            args.batch_size = 16
+        if args.ppo_episodes == 60:
+            args.ppo_episodes = 40
+        if args.sac_episodes == 80:
+            args.sac_episodes = 50
+        elif args.sac_episodes == 0 and args.formal_rl:
+            args.sac_episodes = 50
+        if args.eval_islands in (12, 24):
+            args.eval_islands = 16
 
 
 def split_indices(
@@ -1247,6 +1298,7 @@ def main() -> None:
     apply_formal_vae_preset(args)
     apply_formal_rl_preset(args)
     apply_optuna_best_trial(args)
+    apply_fast_profile(args)
     set_seed(args.seed)
     configure_matplotlib_chinese()
 
@@ -1266,6 +1318,7 @@ def main() -> None:
     print(f"SAC ??????        : {args.sac_episodes}")
     print(f"??? VAE-only ???   : {args.formal_vae_only}")
     print(f"??? formal RL ???  : {args.formal_rl}")
+    print(f"??? fast profile ? : {args.fast_profile}")
     if args.optuna_best_trial:
         print(f"Optuna ??????     : {Path(args.optuna_best_trial).resolve()}")
 

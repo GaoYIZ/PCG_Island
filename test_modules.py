@@ -21,7 +21,7 @@ from pcg_generator import PCGIslandGenerator
 from ppo_baseline import PPOAgent
 from rl_environment import IslandGenerationEnv
 from structure_evaluator import StructureEvaluator
-from formal_experiment import apply_formal_rl_preset, apply_formal_vae_preset, apply_optuna_best_trial, split_indices, subset_arrays
+from formal_experiment import apply_fast_profile, apply_formal_rl_preset, apply_formal_vae_preset, apply_optuna_best_trial, split_indices, subset_arrays
 from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
 
 
@@ -375,6 +375,34 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(args.vae_land_recon_focus_weight, 2.7)
         self.assertAlmostEqual(args.vae_coast_recon_focus_weight, 3.9)
         self.assertAlmostEqual(args.vae_lr, 5e-4)
+
+    def test_fast_profile_downshifts_64x64_formal_rl(self) -> None:
+        class Args:
+            fast_profile = True
+            formal_rl = True
+            map_size = 64
+            dataset_samples = 500
+            min_clean_samples = 500
+            max_dataset_samples = 2000
+            vae_epochs = 50
+            batch_size = 16
+            latent_dim = 128
+            ppo_episodes = 60
+            sac_episodes = 80
+            eval_islands = 24
+
+        args = Args()
+        apply_fast_profile(args)
+
+        self.assertEqual(args.dataset_samples, 240)
+        self.assertEqual(args.min_clean_samples, 240)
+        self.assertEqual(args.max_dataset_samples, 960)
+        self.assertEqual(args.vae_epochs, 24)
+        self.assertEqual(args.batch_size, 32)
+        self.assertEqual(args.latent_dim, 64)
+        self.assertEqual(args.ppo_episodes, 36)
+        self.assertEqual(args.sac_episodes, 40)
+        self.assertEqual(args.eval_islands, 12)
 
     def test_cmaes_baseline_runs_in_normalized_space(self) -> None:
         optimizer = CMAESOptimizer(
