@@ -4,7 +4,7 @@ Beta-VAE model and latent extraction helpers for island heightmaps.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -60,6 +60,7 @@ class BetaVAE(nn.Module):
         structure_dim: int = 0,
         structure_loss_weight: float = 0.0,
         metric_alignment_loss_weight: float = 0.35,
+        structure_loss_weights: Sequence[float] | None = None,
         land_recon_focus_weight: float = 1.5,
         coast_recon_focus_weight: float = 2.0,
     ):
@@ -86,6 +87,15 @@ class BetaVAE(nn.Module):
         self.metric_alignment_loss_weight = float(metric_alignment_loss_weight)
         self.land_recon_focus_weight = float(land_recon_focus_weight)
         self.coast_recon_focus_weight = float(coast_recon_focus_weight)
+        if structure_loss_weights is not None:
+            weights = torch.as_tensor(structure_loss_weights, dtype=torch.float32)
+            if weights.numel() != self.structure_dim:
+                raise ValueError(
+                    f"structure_loss_weights length {weights.numel()} does not match structure_dim {self.structure_dim}."
+                )
+            self.register_buffer("structure_loss_weights", weights.view(1, -1))
+        else:
+            self.structure_loss_weights = None
 
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=4, stride=2, padding=1),
@@ -241,6 +251,7 @@ class BetaVAE(nn.Module):
     def _metric_alignment_loss(
         latent: torch.Tensor,
         structure_target: torch.Tensor,
+        structure_weights: torch.Tensor | None = None,
         eps: float = 1e-6,
     ) -> torch.Tensor:
         if latent.ndim != 2 or structure_target.ndim != 2 or latent.size(0) < 3:
@@ -252,6 +263,8 @@ class BetaVAE(nn.Module):
         target_mean = structure_target.mean(dim=0, keepdim=True)
         target_std = torch.clamp(structure_target.std(dim=0, keepdim=True, unbiased=False), min=eps)
         normalized_target = (structure_target - target_mean) / target_std
+        if structure_weights is not None:
+            normalized_target = normalized_target * structure_weights
 
         latent_dist = torch.cdist(normalized_latent, normalized_latent, p=2)
         target_dist = torch.cdist(normalized_target, normalized_target, p=2)
@@ -318,6 +331,9 @@ class BetaVAE(nn.Module):
         kl_divergence = torch.mean(torch.clamp(kl_per_dim, min=self.free_bits))
         structure_loss = torch.zeros((), device=target.device)
         metric_alignment_loss = torch.zeros((), device=target.device)
+        structure_weights = self.structure_loss_weights
+        if structure_weights is not None:
+            structure_weights = structure_weights.to(target.device)
         if (
             self.structure_loss_weight > 0.0
             and structure_prediction is not None
@@ -327,20 +343,29 @@ class BetaVAE(nn.Module):
             structure_std = torch.clamp(structure_target.std(dim=0, keepdim=True, unbiased=False), min=1e-6)
             standardized_prediction = (structure_prediction - structure_mean) / structure_std
             standardized_target = (structure_target - structure_mean) / structure_std
-            structure_loss = 0.5 * F.smooth_l1_loss(
+            raw_loss_map = F.smooth_l1_loss(
                 structure_prediction,
                 structure_target,
-                reduction="mean",
-            ) + 0.5 * F.smooth_l1_loss(
+                reduction="none",
+            )
+            standardized_loss_map = F.smooth_l1_loss(
                 standardized_prediction,
                 standardized_target,
-                reduction="mean",
+                reduction="none",
             )
+            if structure_weights is not None:
+                raw_loss_map = raw_loss_map * structure_weights
+                standardized_loss_map = standardized_loss_map * structure_weights
+            structure_loss = 0.5 * raw_loss_map.mean() + 0.5 * standardized_loss_map.mean()
         if (
             self.metric_alignment_loss_weight > 0.0
             and structure_target is not None
         ):
-            metric_alignment_loss = self._metric_alignment_loss(mu, structure_target)
+            metric_alignment_loss = self._metric_alignment_loss(
+                mu,
+                structure_target,
+                structure_weights=structure_weights,
+            )
 
         total_loss = (
             recon_loss

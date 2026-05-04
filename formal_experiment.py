@@ -44,6 +44,14 @@ from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
 
 
 COAST_THRESHOLD = 0.30
+STRUCTURE_SUPERVISION_WEIGHTS: Dict[str, float] = {
+    "connectivity": 1.8,
+    "navigable_ratio": 1.3,
+    "coast_complexity": 1.5,
+    "terrain_variance": 1.0,
+    "path_reachability": 2.2,
+    "land_ratio": 0.8,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-land-dice-loss-weight", type=float, default=0.12, help="Land-region Dice loss weight")
     parser.add_argument("--vae-coast-dice-loss-weight", type=float, default=0.32, help="Coast-band Dice loss weight")
     parser.add_argument("--vae-structure-loss-weight", type=float, default=0.12, help="Structure-supervision loss weight")
+    parser.add_argument("--vae-metric-alignment-loss-weight", type=float, default=0.35, help="Latent geometry alignment loss weight for structure metrics")
     parser.add_argument("--vae-land-recon-focus-weight", type=float, default=2.0, help="Extra reconstruction focus on land pixels")
     parser.add_argument("--vae-coast-recon-focus-weight", type=float, default=3.2, help="Extra reconstruction focus on coast-band pixels")
     parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE learning rate")
@@ -165,6 +174,7 @@ def apply_optuna_best_trial(args: argparse.Namespace) -> None:
         "land_dice_loss_weight": "vae_land_dice_loss_weight",
         "coast_dice_loss_weight": "vae_coast_dice_loss_weight",
         "structure_loss_weight": "vae_structure_loss_weight",
+        "metric_alignment_loss_weight": "vae_metric_alignment_loss_weight",
         "land_recon_focus_weight": "vae_land_recon_focus_weight",
         "coast_recon_focus_weight": "vae_coast_recon_focus_weight",
         "learning_rate": "vae_lr",
@@ -282,6 +292,10 @@ def configure_matplotlib_chinese() -> None:
     if selected:
         plt.rcParams["font.sans-serif"] = selected + ["DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
+
+
+def get_structure_supervision_weights(metric_names: Sequence[str]) -> List[float]:
+    return [float(STRUCTURE_SUPERVISION_WEIGHTS.get(name, 1.0)) for name in metric_names]
 
 
 def draw_heightmap_with_coast(
@@ -561,16 +575,18 @@ def build_dataset(
 def train_formal_vae(
     args: argparse.Namespace,
     arrays: Dict[str, np.ndarray],
+    metric_names: Sequence[str],
     output_dir: Path,
     device: torch.device,
 ) -> Tuple[BetaVAE, np.ndarray, List[dict]]:
     print_section("第二阶段：VAE 训练与隐向量提取")
     dataset = HeightmapDataset(
         arrays["heightmaps"],
-        structure_targets=arrays["core_metric_matrix"],
+        structure_targets=arrays["metric_matrix"],
         augment=True,
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    structure_metric_names = tuple(metric_names)
 
     vae = BetaVAE(
         map_size=args.map_size,
@@ -583,8 +599,10 @@ def train_formal_vae(
         coast_loss_weight=args.vae_coast_loss_weight,
         land_dice_loss_weight=args.vae_land_dice_loss_weight,
         coast_dice_loss_weight=args.vae_coast_dice_loss_weight,
-        structure_dim=arrays["core_metric_matrix"].shape[1],
+        structure_dim=arrays["metric_matrix"].shape[1],
         structure_loss_weight=args.vae_structure_loss_weight,
+        metric_alignment_loss_weight=args.vae_metric_alignment_loss_weight,
+        structure_loss_weights=get_structure_supervision_weights(structure_metric_names),
         land_recon_focus_weight=args.vae_land_recon_focus_weight,
         coast_recon_focus_weight=args.vae_coast_recon_focus_weight,
     ).to(device)
@@ -635,6 +653,10 @@ def train_formal_vae(
                 "land_dice_loss_weight": args.vae_land_dice_loss_weight,
                 "coast_dice_loss_weight": args.vae_coast_dice_loss_weight,
                 "structure_loss_weight": args.vae_structure_loss_weight,
+                "metric_alignment_loss_weight": args.vae_metric_alignment_loss_weight,
+                "structure_supervision_weights": {
+                    name: weight for name, weight in zip(structure_metric_names, get_structure_supervision_weights(structure_metric_names))
+                },
                 "land_recon_focus_weight": args.vae_land_recon_focus_weight,
                 "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
                 "learning_rate": args.vae_lr,
@@ -670,8 +692,7 @@ def evaluate_vae_representation(
         output_dir / "vae_reconstruction.png",
     )
     original_metrics = arrays["metric_matrix"]
-    core_metric_names = tuple(builder.evaluator.core_metric_names)
-    core_original_metrics = arrays["core_metric_matrix"]
+    structure_metric_names = tuple(builder.evaluator.metric_names)
     land_mask, coast_band = build_focus_masks(arrays["heightmaps"])
     reconstructed_metrics = np.array(
         [
@@ -701,18 +722,18 @@ def evaluate_vae_representation(
 
     structure_head_mae = {}
     structure_head_corr = {}
-    if structure_predictions.shape == core_original_metrics.shape:
-        for idx, name in enumerate(core_metric_names):
+    if structure_predictions.shape == original_metrics.shape:
+        for idx, name in enumerate(structure_metric_names):
             predicted = structure_predictions[:, idx]
-            origin = core_original_metrics[:, idx]
+            origin = original_metrics[:, idx]
             structure_head_mae[name] = float(np.mean(np.abs(origin - predicted)))
             if np.std(origin) < 1e-8 or np.std(predicted) < 1e-8:
                 structure_head_corr[name] = 0.0
             else:
                 structure_head_corr[name] = float(np.corrcoef(origin, predicted)[0, 1])
     else:
-        structure_head_mae = {name: 0.0 for name in core_metric_names}
-        structure_head_corr = {name: 0.0 for name in core_metric_names}
+        structure_head_mae = {name: 0.0 for name in structure_metric_names}
+        structure_head_corr = {name: 0.0 for name in structure_metric_names}
 
     latent_std_per_dim = latents.std(axis=0) if len(latents) > 0 else np.zeros((args.latent_dim,), dtype=np.float32)
     latent_global_std = float(latents.std()) if len(latents) > 0 else 0.0
@@ -723,8 +744,8 @@ def evaluate_vae_representation(
     if len(latents) >= 6:
         n_splits = min(5, len(latents))
         kfold = KFold(n_splits=n_splits, shuffle=True, random_state=args.seed)
-        for idx, name in enumerate(core_metric_names):
-            target = core_original_metrics[:, idx]
+        for idx, name in enumerate(structure_metric_names):
+            target = original_metrics[:, idx]
             if float(np.std(target)) < 1e-8:
                 predictive_r2[name] = 0.0
                 continue
@@ -737,7 +758,7 @@ def evaluate_vae_representation(
             )
             predictive_r2[name] = float(np.mean(scores))
     else:
-        predictive_r2 = {name: 0.0 for name in core_metric_names}
+        predictive_r2 = {name: 0.0 for name in structure_metric_names}
 
     land_index = builder.evaluator.metric_names.index("land_ratio")
     plot_metric_bars(metric_mae, "VAE 结构指标重建误差", "平均绝对误差", output_dir / "vae_metric_mae.png")
@@ -799,6 +820,7 @@ def save_trained_vae_artifacts(
     args: argparse.Namespace,
     vae: BetaVAE,
     feature_normalizer: IslandFeatureNormalizer,
+    metric_names: Sequence[str],
     output_dir: Path,
 ) -> None:
     artifact_dir = output_dir / "artifacts"
@@ -818,6 +840,11 @@ def save_trained_vae_artifacts(
                 "land_dice_loss_weight": args.vae_land_dice_loss_weight,
                 "coast_dice_loss_weight": args.vae_coast_dice_loss_weight,
                 "structure_loss_weight": args.vae_structure_loss_weight,
+                "metric_alignment_loss_weight": args.vae_metric_alignment_loss_weight,
+                "structure_supervision_weights": {
+                    name: weight
+                    for name, weight in zip(metric_names, get_structure_supervision_weights(metric_names))
+                },
                 "land_recon_focus_weight": args.vae_land_recon_focus_weight,
                 "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
             },
@@ -855,12 +882,18 @@ def run_formal_vae_pipeline(
 
     train_dir = output_dir / "train_split"
     train_dir.mkdir(parents=True, exist_ok=True)
-    vae, train_latents, history = train_formal_vae(args, split_arrays_map["train"], train_dir, device)
+    vae, train_latents, history = train_formal_vae(
+        args,
+        split_arrays_map["train"],
+        builder.evaluator.metric_names,
+        train_dir,
+        device,
+    )
     feature_normalizer = builder.fit_feature_normalizer(
         split_clean_samples["train"],
         latent_matrix=train_latents,
     )
-    save_trained_vae_artifacts(args, vae, feature_normalizer, output_dir)
+    save_trained_vae_artifacts(args, vae, feature_normalizer, builder.evaluator.metric_names, output_dir)
 
     split_summaries: Dict[str, Dict[str, object]] = {}
     split_latents: Dict[str, np.ndarray] = {"train": train_latents}
@@ -932,6 +965,11 @@ def run_formal_vae_pipeline(
             "land_dice_loss_weight": args.vae_land_dice_loss_weight,
             "coast_dice_loss_weight": args.vae_coast_dice_loss_weight,
             "structure_loss_weight": args.vae_structure_loss_weight,
+            "metric_alignment_loss_weight": args.vae_metric_alignment_loss_weight,
+            "structure_supervision_weights": {
+                name: weight
+                for name, weight in zip(builder.evaluator.metric_names, get_structure_supervision_weights(builder.evaluator.metric_names))
+            },
             "land_recon_focus_weight": args.vae_land_recon_focus_weight,
             "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
             "learning_rate": args.vae_lr,
@@ -1222,9 +1260,9 @@ def evaluate_agent(
     rewards: List[float] = []
     heightmaps: List[np.ndarray] = []
     records: List[Dict[str, object]] = []
+    env = env_factory()
 
     for index in range(num_islands):
-        env = env_factory()
         state, _ = env.reset(seed=seed_offset + index)
         episode_reward = 0.0
         info = {}
@@ -1365,7 +1403,7 @@ def main() -> None:
         print(f"RL ????????      : {final_summary['state_definition']['state_dim']}")
         return
 
-    vae, latents, _ = train_formal_vae(args, arrays, output_dir, device)
+    vae, latents, _ = train_formal_vae(args, arrays, builder.evaluator.metric_names, output_dir, device)
 
     print_section("第三阶段：特征归一化拟合")
     metric_names = builder.evaluator.metric_names

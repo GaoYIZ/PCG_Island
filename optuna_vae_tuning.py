@@ -19,6 +19,26 @@ from dataset_pipeline import IslandDatasetBuilder
 from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
 
 COAST_THRESHOLD = 0.30
+STRUCTURE_METRIC_NAMES = (
+    "connectivity",
+    "navigable_ratio",
+    "coast_complexity",
+    "terrain_variance",
+    "path_reachability",
+    "land_ratio",
+)
+STRUCTURE_WEIGHT_MAP = {
+    "connectivity": 1.8,
+    "navigable_ratio": 1.3,
+    "coast_complexity": 1.5,
+    "terrain_variance": 1.0,
+    "path_reachability": 2.2,
+    "land_ratio": 0.8,
+}
+
+
+def get_structure_supervision_weights(metric_names: tuple[str, ...] = STRUCTURE_METRIC_NAMES) -> list[float]:
+    return [float(STRUCTURE_WEIGHT_MAP.get(name, 1.0)) for name in metric_names]
 
 
 def parse_args() -> argparse.Namespace:
@@ -134,13 +154,7 @@ def compute_latent_predictive_r2(
     val_latents: np.ndarray,
     val_metrics: np.ndarray,
 ) -> tuple[dict[str, float], float]:
-    metric_names = (
-        "connectivity",
-        "navigable_ratio",
-        "coast_complexity",
-        "terrain_variance",
-        "path_reachability",
-    )
+    metric_names = STRUCTURE_METRIC_NAMES
     scores: dict[str, float] = {}
     if len(train_latents) < 6 or len(val_latents) < 3:
         return {name: 0.0 for name in metric_names}, 0.0
@@ -166,7 +180,7 @@ def main() -> None:
     arrays = build_arrays(args)
     train_heightmaps, val_heightmaps, train_metrics, val_metrics = train_test_split(
         arrays["heightmaps"],
-        arrays["core_metric_matrix"],
+        arrays["metric_matrix"],
         test_size=0.2,
         random_state=args.seed,
     )
@@ -204,6 +218,7 @@ def main() -> None:
             structure_dim=train_metrics.shape[1],
             structure_loss_weight=structure_loss_weight,
             metric_alignment_loss_weight=metric_alignment_loss_weight,
+            structure_loss_weights=get_structure_supervision_weights(),
             land_recon_focus_weight=land_recon_focus_weight,
             coast_recon_focus_weight=coast_recon_focus_weight,
         ).to(device)
@@ -240,15 +255,17 @@ def main() -> None:
             val_metrics=val_metrics,
         )
         clipped_r2 = np.clip(np.array(list(latent_predictive_r2.values()), dtype=np.float32), -1.5, 1.0)
-        predictive_penalty = float(np.mean(np.maximum(0.0, 0.60 - clipped_r2)))
-        worst_case_penalty = float(max(0.0, 0.45 - float(np.min(clipped_r2))))
+        metric_weight_vector = np.array(get_structure_supervision_weights(), dtype=np.float32)
+        normalized_metric_weights = metric_weight_vector / metric_weight_vector.sum()
+        predictive_penalty = float(np.sum(np.maximum(0.0, 0.60 - clipped_r2) * normalized_metric_weights))
+        worst_case_penalty = float(np.max(np.maximum(0.0, 0.45 - clipped_r2) * metric_weight_vector))
         objective_value = (
             0.08 * pixel_mae
             + 0.18 * land_mae
             + 0.20 * coast_band_mae
             + 0.18 * structure_mae
             + 0.30 * predictive_penalty
-            + 0.12 * worst_case_penalty
+            + 0.10 * worst_case_penalty
             + 0.06 * final_kl
             + 0.08 * collapse_penalty
         )
