@@ -44,6 +44,7 @@ class MapScorer:
     def __init__(
         self,
         novelty_scale: float = 0.35,
+        novelty_k: int = 5,
     ):
         self.preferred_ranges = {
             "navigable_ratio": {
@@ -84,6 +85,7 @@ class MapScorer:
             "novelty": 0.10,
         }
         self.novelty_scale = float(novelty_scale)
+        self.novelty_k = int(max(1, novelty_k))
 
     @staticmethod
     def _band_score(
@@ -111,6 +113,7 @@ class MapScorer:
             "structure_weights": self.structure_weights,
             "total_weights": self.total_weights,
             "novelty_scale": self.novelty_scale,
+            "novelty_k": self.novelty_k,
         }
 
     def compute_novelty_score(
@@ -126,9 +129,22 @@ class MapScorer:
         if len(history) == 0:
             return 0.0
 
-        min_distance = min(float(np.linalg.norm(feature_vector - previous)) for previous in history)
-        scale = max(self.novelty_scale * np.sqrt(feature_vector.size), 1e-6)
-        return float(np.clip(min_distance / scale, 0.0, 1.0))
+        history_matrix = np.stack(history, axis=0)
+        distances = np.linalg.norm(history_matrix - feature_vector[None, :], axis=1)
+        positive_distances = distances[distances > 1e-6]
+        if positive_distances.size == 0:
+            return 0.0
+
+        neighbor_count = min(self.novelty_k, positive_distances.size)
+        nearest_distances = np.partition(positive_distances, neighbor_count - 1)[:neighbor_count]
+        neighborhood_distance = float(np.mean(nearest_distances))
+        adaptive_scale = max(
+            float(np.median(positive_distances)),
+            self.novelty_scale * float(np.sqrt(feature_vector.size)),
+            1e-6,
+        )
+        novelty_score = 1.0 - float(np.exp(-neighborhood_distance / adaptive_scale))
+        return float(np.clip(novelty_score, 0.0, 1.0))
 
     def score_metrics(
         self,

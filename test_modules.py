@@ -195,6 +195,20 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertGreater(balanced_score.land_score, oversized_score.land_score)
         self.assertGreater(balanced_score.total_score, oversized_score.total_score)
 
+    def test_novelty_score_is_positive_for_distinct_history(self) -> None:
+        scorer = MapScorer(novelty_scale=0.20, novelty_k=3)
+        feature = np.array([0.8, 0.8, -0.2, 0.4], dtype=np.float32)
+        history = [
+            np.array([-0.8, -0.7, 0.1, -0.3], dtype=np.float32),
+            np.array([-0.5, -0.4, 0.2, -0.1], dtype=np.float32),
+            np.array([0.0, 0.1, -0.1, 0.0], dtype=np.float32),
+        ]
+
+        score = scorer.compute_novelty_score(feature, history)
+
+        self.assertGreater(score, 0.0)
+        self.assertLessEqual(score, 1.0)
+
     def test_vae_helpers_extract_latents(self) -> None:
         heightmaps = np.stack(
             [
@@ -221,6 +235,7 @@ class IslandPipelineTests(unittest.TestCase):
             gradient_loss_weight=0.20,
             structure_dim=structure_targets.shape[1],
             structure_loss_weight=0.2,
+            metric_alignment_loss_weight=0.3,
         )
         history = train_vae(vae, dataloader, epochs=1, device="cpu", warmup_epochs=1)
         latents = encode_heightmaps(vae, heightmaps, batch_size=5, device="cpu")
@@ -235,6 +250,7 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertIn("weighted_mse_loss", history[0])
         self.assertIn("weighted_l1_loss", history[0])
         self.assertIn("structure_loss", history[0])
+        self.assertIn("metric_alignment_loss", history[0])
         self.assertIn("kl_raw", history[0])
         self.assertEqual(latents.shape, (10, 8))
 
@@ -330,6 +346,7 @@ class IslandPipelineTests(unittest.TestCase):
             vae_land_dice_loss_weight = 0.12
             vae_coast_dice_loss_weight = 0.32
             vae_structure_loss_weight = 0.12
+            vae_metric_alignment_loss_weight = 0.35
             vae_land_recon_focus_weight = 2.0
             vae_coast_recon_focus_weight = 3.2
             vae_lr = 8e-4
@@ -347,6 +364,7 @@ class IslandPipelineTests(unittest.TestCase):
                 "land_dice_loss_weight": 0.14,
                 "coast_dice_loss_weight": 0.41,
                 "structure_loss_weight": 0.06,
+                "metric_alignment_loss_weight": 0.52,
                 "land_recon_focus_weight": 2.7,
                 "coast_recon_focus_weight": 3.9,
                 "learning_rate": 5e-4,
@@ -372,6 +390,7 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(args.vae_land_dice_loss_weight, 0.14)
         self.assertAlmostEqual(args.vae_coast_dice_loss_weight, 0.41)
         self.assertAlmostEqual(args.vae_structure_loss_weight, 0.06)
+        self.assertAlmostEqual(args.vae_metric_alignment_loss_weight, 0.52)
         self.assertAlmostEqual(args.vae_land_recon_focus_weight, 2.7)
         self.assertAlmostEqual(args.vae_coast_recon_focus_weight, 3.9)
         self.assertAlmostEqual(args.vae_lr, 5e-4)

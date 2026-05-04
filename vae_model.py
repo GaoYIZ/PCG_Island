@@ -59,6 +59,7 @@ class BetaVAE(nn.Module):
         coast_dice_loss_weight: float = 0.30,
         structure_dim: int = 0,
         structure_loss_weight: float = 0.0,
+        metric_alignment_loss_weight: float = 0.35,
         land_recon_focus_weight: float = 1.5,
         coast_recon_focus_weight: float = 2.0,
     ):
@@ -82,6 +83,7 @@ class BetaVAE(nn.Module):
         self.coast_dice_loss_weight = float(coast_dice_loss_weight)
         self.structure_dim = int(structure_dim)
         self.structure_loss_weight = float(structure_loss_weight)
+        self.metric_alignment_loss_weight = float(metric_alignment_loss_weight)
         self.land_recon_focus_weight = float(land_recon_focus_weight)
         self.coast_recon_focus_weight = float(coast_recon_focus_weight)
 
@@ -110,10 +112,14 @@ class BetaVAE(nn.Module):
             nn.Sigmoid(),
         )
         if self.structure_dim > 0:
+            hidden_dim = max(latent_dim // 2, self.structure_dim * 4, 32)
             self.structure_predictor = nn.Sequential(
                 nn.Linear(latent_dim, latent_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(latent_dim, self.structure_dim),
+                nn.LayerNorm(latent_dim),
+                nn.SiLU(),
+                nn.Linear(latent_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self.structure_dim),
             )
         else:
             self.structure_predictor = None
@@ -231,6 +237,38 @@ class BetaVAE(nn.Module):
         dice = (2.0 * intersection + eps) / (denominator + eps)
         return 1.0 - dice.mean()
 
+    @staticmethod
+    def _metric_alignment_loss(
+        latent: torch.Tensor,
+        structure_target: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        if latent.ndim != 2 or structure_target.ndim != 2 or latent.size(0) < 3:
+            return latent.new_zeros(())
+
+        centered_latent = latent - latent.mean(dim=0, keepdim=True)
+        normalized_latent = F.normalize(centered_latent, dim=1, eps=eps)
+
+        target_mean = structure_target.mean(dim=0, keepdim=True)
+        target_std = torch.clamp(structure_target.std(dim=0, keepdim=True, unbiased=False), min=eps)
+        normalized_target = (structure_target - target_mean) / target_std
+
+        latent_dist = torch.cdist(normalized_latent, normalized_latent, p=2)
+        target_dist = torch.cdist(normalized_target, normalized_target, p=2)
+
+        upper_mask = torch.triu(
+            torch.ones_like(latent_dist, dtype=torch.bool),
+            diagonal=1,
+        )
+        latent_pairs = latent_dist[upper_mask]
+        target_pairs = target_dist[upper_mask]
+        if latent_pairs.numel() == 0:
+            return latent.new_zeros(())
+
+        latent_pairs = latent_pairs / (latent_pairs.mean().detach() + eps)
+        target_pairs = target_pairs / (target_pairs.mean().detach() + eps)
+        return F.smooth_l1_loss(latent_pairs, target_pairs, reduction="mean")
+
     def loss_function(
         self,
         reconstruction: torch.Tensor,
@@ -279,14 +317,37 @@ class BetaVAE(nn.Module):
         kl_per_dim = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp(), dim=0)
         kl_divergence = torch.mean(torch.clamp(kl_per_dim, min=self.free_bits))
         structure_loss = torch.zeros((), device=target.device)
+        metric_alignment_loss = torch.zeros((), device=target.device)
         if (
             self.structure_loss_weight > 0.0
             and structure_prediction is not None
             and structure_target is not None
         ):
-            structure_loss = F.smooth_l1_loss(structure_prediction, structure_target, reduction="mean")
+            structure_mean = structure_target.mean(dim=0, keepdim=True)
+            structure_std = torch.clamp(structure_target.std(dim=0, keepdim=True, unbiased=False), min=1e-6)
+            standardized_prediction = (structure_prediction - structure_mean) / structure_std
+            standardized_target = (structure_target - structure_mean) / structure_std
+            structure_loss = 0.5 * F.smooth_l1_loss(
+                structure_prediction,
+                structure_target,
+                reduction="mean",
+            ) + 0.5 * F.smooth_l1_loss(
+                standardized_prediction,
+                standardized_target,
+                reduction="mean",
+            )
+        if (
+            self.metric_alignment_loss_weight > 0.0
+            and structure_target is not None
+        ):
+            metric_alignment_loss = self._metric_alignment_loss(mu, structure_target)
 
-        total_loss = recon_loss + self.current_beta * kl_divergence + self.structure_loss_weight * structure_loss
+        total_loss = (
+            recon_loss
+            + self.current_beta * kl_divergence
+            + self.structure_loss_weight * structure_loss
+            + self.metric_alignment_loss_weight * metric_alignment_loss
+        )
         return {
             "total_loss": total_loss,
             "recon_loss": recon_loss,
@@ -300,6 +361,7 @@ class BetaVAE(nn.Module):
             "coast_loss": coast_loss,
             "coast_dice_loss": coast_dice_loss,
             "structure_loss": structure_loss,
+            "metric_alignment_loss": metric_alignment_loss,
             "kl_divergence": kl_divergence,
             "kl_raw": torch.mean(kl_per_dim),
             "beta": torch.tensor(self.current_beta, device=target.device),
@@ -383,6 +445,7 @@ def train_vae(
         weighted_mse_loss = 0.0
         weighted_l1_loss = 0.0
         structure_loss = 0.0
+        metric_alignment_loss = 0.0
         kl_loss = 0.0
         kl_raw = 0.0
         num_batches = 0
@@ -420,6 +483,7 @@ def train_vae(
             coast_loss += float(losses["coast_loss"].item())
             coast_dice_loss += float(losses["coast_dice_loss"].item())
             structure_loss += float(losses["structure_loss"].item())
+            metric_alignment_loss += float(losses["metric_alignment_loss"].item())
             kl_loss += float(losses["kl_divergence"].item())
             kl_raw += float(losses["kl_raw"].item())
             num_batches += 1
@@ -439,6 +503,7 @@ def train_vae(
             "coast_loss": coast_loss / max(num_batches, 1),
             "coast_dice_loss": coast_dice_loss / max(num_batches, 1),
             "structure_loss": structure_loss / max(num_batches, 1),
+            "metric_alignment_loss": metric_alignment_loss / max(num_batches, 1),
             "kl_loss": kl_loss / max(num_batches, 1),
             "kl_raw": kl_raw / max(num_batches, 1),
         }
@@ -466,6 +531,7 @@ def train_vae(
                 f"coast={epoch_metrics['coast_loss']:.4f} "
                 f"coast_dice={epoch_metrics['coast_dice_loss']:.4f} "
                 f"struct={epoch_metrics['structure_loss']:.4f} "
+                f"align={epoch_metrics['metric_alignment_loss']:.4f} "
                 f"kl={epoch_metrics['kl_loss']:.4f} "
                 f"lr={optimizer.param_groups[0]['lr']:.6f}"
             )

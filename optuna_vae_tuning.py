@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import optuna
 import torch
+from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
@@ -127,6 +128,35 @@ def predict_structure(vae: BetaVAE, heightmaps: np.ndarray, batch_size: int, dev
     return np.concatenate(outputs, axis=0)
 
 
+def compute_latent_predictive_r2(
+    train_latents: np.ndarray,
+    train_metrics: np.ndarray,
+    val_latents: np.ndarray,
+    val_metrics: np.ndarray,
+) -> tuple[dict[str, float], float]:
+    metric_names = (
+        "connectivity",
+        "navigable_ratio",
+        "coast_complexity",
+        "terrain_variance",
+        "path_reachability",
+    )
+    scores: dict[str, float] = {}
+    if len(train_latents) < 6 or len(val_latents) < 3:
+        return {name: 0.0 for name in metric_names}, 0.0
+
+    for idx, name in enumerate(metric_names):
+        target_train = train_metrics[:, idx]
+        target_val = val_metrics[:, idx]
+        if float(np.std(target_train)) < 1e-8 or float(np.std(target_val)) < 1e-8:
+            scores[name] = 0.0
+            continue
+        model = LinearRegression()
+        model.fit(train_latents, target_train)
+        scores[name] = float(model.score(val_latents, target_val))
+    return scores, float(np.mean(list(scores.values())))
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -151,7 +181,8 @@ def main() -> None:
         coast_loss_weight = trial.suggest_float("coast_loss_weight", 0.15, 0.45)
         land_dice_loss_weight = trial.suggest_float("land_dice_loss_weight", 0.05, 0.30)
         coast_dice_loss_weight = trial.suggest_float("coast_dice_loss_weight", 0.15, 0.50)
-        structure_loss_weight = trial.suggest_float("structure_loss_weight", 0.04, 0.30)
+        structure_loss_weight = trial.suggest_float("structure_loss_weight", 0.10, 1.20)
+        metric_alignment_loss_weight = trial.suggest_float("metric_alignment_loss_weight", 0.05, 1.20)
         land_recon_focus_weight = trial.suggest_float("land_recon_focus_weight", 1.2, 3.5)
         coast_recon_focus_weight = trial.suggest_float("coast_recon_focus_weight", 2.0, 5.5)
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 2e-3, log=True)
@@ -172,6 +203,7 @@ def main() -> None:
             coast_dice_loss_weight=coast_dice_loss_weight,
             structure_dim=train_metrics.shape[1],
             structure_loss_weight=structure_loss_weight,
+            metric_alignment_loss_weight=metric_alignment_loss_weight,
             land_recon_focus_weight=land_recon_focus_weight,
             coast_recon_focus_weight=coast_recon_focus_weight,
         ).to(device)
@@ -186,6 +218,7 @@ def main() -> None:
         )
         reconstructions = reconstruct(vae, val_heightmaps, args.batch_size, device)
         predictions = predict_structure(vae, val_heightmaps, args.batch_size, device)
+        train_latents = encode_heightmaps(vae, train_heightmaps, batch_size=args.batch_size, device=str(device))
         latents = encode_heightmaps(vae, val_heightmaps, batch_size=args.batch_size, device=str(device))
 
         pixel_mse = float(np.mean((val_heightmaps - reconstructions) ** 2))
@@ -200,13 +233,24 @@ def main() -> None:
         active_threshold = max(1e-3, latent_global_std * 0.02)
         active_ratio = float(np.mean(latent_std_per_dim > active_threshold)) if args.latent_dim > 0 else 0.0
         collapse_penalty = max(0.0, 0.35 - active_ratio)
+        latent_predictive_r2, latent_predictive_r2_mean = compute_latent_predictive_r2(
+            train_latents=train_latents,
+            train_metrics=train_metrics,
+            val_latents=latents,
+            val_metrics=val_metrics,
+        )
+        clipped_r2 = np.clip(np.array(list(latent_predictive_r2.values()), dtype=np.float32), -1.5, 1.0)
+        predictive_penalty = float(np.mean(np.maximum(0.0, 0.60 - clipped_r2)))
+        worst_case_penalty = float(max(0.0, 0.45 - float(np.min(clipped_r2))))
         objective_value = (
-            0.12 * pixel_mae
-            + 0.30 * land_mae
-            + 0.48 * coast_band_mae
-            + 0.15 * structure_mae
-            + 0.08 * final_kl
-            + 0.10 * collapse_penalty
+            0.08 * pixel_mae
+            + 0.18 * land_mae
+            + 0.20 * coast_band_mae
+            + 0.18 * structure_mae
+            + 0.30 * predictive_penalty
+            + 0.12 * worst_case_penalty
+            + 0.06 * final_kl
+            + 0.08 * collapse_penalty
         )
 
         trial.set_user_attr("pixel_mse", pixel_mse)
@@ -217,6 +261,10 @@ def main() -> None:
         trial.set_user_attr("final_kl", final_kl)
         trial.set_user_attr("active_ratio", active_ratio)
         trial.set_user_attr("latent_global_std", latent_global_std)
+        trial.set_user_attr("latent_predictive_r2", latent_predictive_r2)
+        trial.set_user_attr("latent_predictive_r2_mean", latent_predictive_r2_mean)
+        trial.set_user_attr("latent_predictive_penalty", predictive_penalty)
+        trial.set_user_attr("latent_predictive_worst_case_penalty", worst_case_penalty)
         return objective_value
 
     study = optuna.create_study(direction="minimize", study_name="island_vae_tuning")
