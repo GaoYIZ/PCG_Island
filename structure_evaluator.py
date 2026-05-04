@@ -30,6 +30,15 @@ class StructureEvaluator:
         "path_reachability",
         "land_ratio",
     )
+    supervision_metric_names: Sequence[str] = (
+        "connectivity",
+        "navigable_ratio",
+        "coast_complexity",
+        "terrain_variance",
+        "path_reachability",
+        "land_ratio",
+        "component_count",
+    )
 
     def __init__(
         self,

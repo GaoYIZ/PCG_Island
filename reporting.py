@@ -18,6 +18,7 @@ METRIC_LABELS_ZH: Dict[str, str] = {
     "terrain_variance": "地形方差",
     "path_reachability": "路径可达性",
     "land_ratio": "陆地占比",
+    "component_count": "连通块数量",
     "total_score": "总评分",
     "structure_score": "结构评分",
     "path_score": "路径评分",

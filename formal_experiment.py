@@ -51,6 +51,7 @@ STRUCTURE_SUPERVISION_WEIGHTS: Dict[str, float] = {
     "terrain_variance": 1.0,
     "path_reachability": 2.2,
     "land_ratio": 0.8,
+    "component_count": 1.8,
 }
 
 
@@ -605,7 +606,7 @@ def train_formal_vae(
     print_section("第二阶段：VAE 训练与隐向量提取")
     dataset = HeightmapDataset(
         arrays["heightmaps"],
-        structure_targets=arrays["metric_matrix"],
+        structure_targets=arrays["supervision_metric_matrix"],
         augment=True,
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
@@ -622,7 +623,7 @@ def train_formal_vae(
         coast_loss_weight=args.vae_coast_loss_weight,
         land_dice_loss_weight=args.vae_land_dice_loss_weight,
         coast_dice_loss_weight=args.vae_coast_dice_loss_weight,
-        structure_dim=arrays["metric_matrix"].shape[1],
+        structure_dim=arrays["supervision_metric_matrix"].shape[1],
         structure_loss_weight=args.vae_structure_loss_weight,
         metric_alignment_loss_weight=args.vae_metric_alignment_loss_weight,
         structure_loss_weights=get_structure_supervision_weights(
@@ -728,12 +729,12 @@ def evaluate_vae_representation(
         reconstructions[:6],
         output_dir / "vae_reconstruction.png",
     )
-    original_metrics = arrays["metric_matrix"]
-    structure_metric_names = tuple(builder.evaluator.metric_names)
+    original_metrics = arrays["supervision_metric_matrix"]
+    structure_metric_names = tuple(builder.evaluator.supervision_metric_names)
     land_mask, coast_band = build_focus_masks(arrays["heightmaps"])
     reconstructed_metrics = np.array(
         [
-            [builder.evaluator.evaluate(heightmap)[name] for name in builder.evaluator.metric_names]
+            [builder.evaluator.evaluate(heightmap)[name] for name in builder.evaluator.supervision_metric_names]
             for heightmap in reconstructions
         ],
         dtype=np.float32,
@@ -746,10 +747,10 @@ def evaluate_vae_representation(
     coast_band_mae = masked_mae(arrays["heightmaps"], reconstructions, coast_band)
     metric_mae = {
         name: float(np.mean(np.abs(original_metrics[:, idx] - reconstructed_metrics[:, idx])))
-        for idx, name in enumerate(builder.evaluator.metric_names)
+        for idx, name in enumerate(structure_metric_names)
     }
     metric_corr = {}
-    for idx, name in enumerate(builder.evaluator.metric_names):
+    for idx, name in enumerate(structure_metric_names):
         origin = original_metrics[:, idx]
         recon = reconstructed_metrics[:, idx]
         if np.std(origin) < 1e-8 or np.std(recon) < 1e-8:
@@ -931,7 +932,7 @@ def run_formal_vae_pipeline(
     vae, train_latents, history = train_formal_vae(
         args,
         split_arrays_map["train"],
-        builder.evaluator.metric_names,
+        builder.evaluator.supervision_metric_names,
         train_dir,
         device,
     )
@@ -939,7 +940,7 @@ def run_formal_vae_pipeline(
         split_clean_samples["train"],
         latent_matrix=train_latents,
     )
-    save_trained_vae_artifacts(args, vae, feature_normalizer, builder.evaluator.metric_names, output_dir)
+    save_trained_vae_artifacts(args, vae, feature_normalizer, builder.evaluator.supervision_metric_names, output_dir)
 
     split_summaries: Dict[str, Dict[str, object]] = {}
     split_latents: Dict[str, np.ndarray] = {"train": train_latents}
@@ -1458,7 +1459,7 @@ def main() -> None:
         print(f"RL ????????      : {final_summary['state_definition']['state_dim']}")
         return
 
-    vae, latents, _ = train_formal_vae(args, arrays, builder.evaluator.metric_names, output_dir, device)
+    vae, latents, _ = train_formal_vae(args, arrays, builder.evaluator.supervision_metric_names, output_dir, device)
 
     print_section("第三阶段：特征归一化拟合")
     metric_names = builder.evaluator.metric_names

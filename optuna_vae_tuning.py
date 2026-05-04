@@ -26,6 +26,7 @@ STRUCTURE_METRIC_NAMES = (
     "terrain_variance",
     "path_reachability",
     "land_ratio",
+    "component_count",
 )
 STRUCTURE_WEIGHT_MAP = {
     "connectivity": 1.8,
@@ -34,6 +35,7 @@ STRUCTURE_WEIGHT_MAP = {
     "terrain_variance": 1.0,
     "path_reachability": 2.2,
     "land_ratio": 0.8,
+    "component_count": 1.8,
 }
 
 
@@ -190,7 +192,7 @@ def main() -> None:
     arrays = build_arrays(args)
     train_heightmaps, val_heightmaps, train_metrics, val_metrics = train_test_split(
         arrays["heightmaps"],
-        arrays["metric_matrix"],
+        arrays["supervision_metric_matrix"],
         test_size=0.2,
         random_state=args.seed,
     )

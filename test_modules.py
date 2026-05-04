@@ -110,6 +110,11 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertIn("land_ratio", summary["metric_stats"])
         self.assertEqual(arrays["heightmaps"].ndim, 3)
         self.assertEqual(arrays["normalized_params"].shape[1], len(builder.param_normalizer.param_names))
+        self.assertEqual(
+            arrays["supervision_metric_matrix"].shape[1],
+            len(builder.evaluator.supervision_metric_names),
+        )
+        self.assertIn("component_count", builder.evaluator.supervision_metric_names)
 
     def test_feature_normalization_keeps_values_on_shared_scale(self) -> None:
         metrics_list = [
