@@ -347,6 +347,8 @@ class IslandPipelineTests(unittest.TestCase):
             vae_coast_dice_loss_weight = 0.32
             vae_structure_loss_weight = 0.12
             vae_metric_alignment_loss_weight = 0.35
+            vae_connectivity_supervision_weight = 1.8
+            vae_path_reachability_supervision_weight = 2.2
             vae_land_recon_focus_weight = 2.0
             vae_coast_recon_focus_weight = 3.2
             vae_lr = 8e-4
@@ -365,6 +367,8 @@ class IslandPipelineTests(unittest.TestCase):
                 "coast_dice_loss_weight": 0.41,
                 "structure_loss_weight": 0.06,
                 "metric_alignment_loss_weight": 0.52,
+                "connectivity_supervision_weight": 2.9,
+                "path_reachability_supervision_weight": 3.8,
                 "land_recon_focus_weight": 2.7,
                 "coast_recon_focus_weight": 3.9,
                 "learning_rate": 5e-4,
@@ -391,6 +395,8 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(args.vae_coast_dice_loss_weight, 0.41)
         self.assertAlmostEqual(args.vae_structure_loss_weight, 0.06)
         self.assertAlmostEqual(args.vae_metric_alignment_loss_weight, 0.52)
+        self.assertAlmostEqual(args.vae_connectivity_supervision_weight, 2.9)
+        self.assertAlmostEqual(args.vae_path_reachability_supervision_weight, 3.8)
         self.assertAlmostEqual(args.vae_land_recon_focus_weight, 2.7)
         self.assertAlmostEqual(args.vae_coast_recon_focus_weight, 3.9)
         self.assertAlmostEqual(args.vae_lr, 5e-4)

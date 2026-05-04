@@ -76,6 +76,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-coast-dice-loss-weight", type=float, default=0.32, help="Coast-band Dice loss weight")
     parser.add_argument("--vae-structure-loss-weight", type=float, default=0.12, help="Structure-supervision loss weight")
     parser.add_argument("--vae-metric-alignment-loss-weight", type=float, default=0.35, help="Latent geometry alignment loss weight for structure metrics")
+    parser.add_argument(
+        "--vae-connectivity-supervision-weight",
+        type=float,
+        default=STRUCTURE_SUPERVISION_WEIGHTS["connectivity"],
+        help="Per-metric supervision weight for connectivity",
+    )
+    parser.add_argument(
+        "--vae-path-reachability-supervision-weight",
+        type=float,
+        default=STRUCTURE_SUPERVISION_WEIGHTS["path_reachability"],
+        help="Per-metric supervision weight for path reachability",
+    )
     parser.add_argument("--vae-land-recon-focus-weight", type=float, default=2.0, help="Extra reconstruction focus on land pixels")
     parser.add_argument("--vae-coast-recon-focus-weight", type=float, default=3.2, help="Extra reconstruction focus on coast-band pixels")
     parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE learning rate")
@@ -175,6 +187,8 @@ def apply_optuna_best_trial(args: argparse.Namespace) -> None:
         "coast_dice_loss_weight": "vae_coast_dice_loss_weight",
         "structure_loss_weight": "vae_structure_loss_weight",
         "metric_alignment_loss_weight": "vae_metric_alignment_loss_weight",
+        "connectivity_supervision_weight": "vae_connectivity_supervision_weight",
+        "path_reachability_supervision_weight": "vae_path_reachability_supervision_weight",
         "land_recon_focus_weight": "vae_land_recon_focus_weight",
         "coast_recon_focus_weight": "vae_coast_recon_focus_weight",
         "learning_rate": "vae_lr",
@@ -294,8 +308,17 @@ def configure_matplotlib_chinese() -> None:
     plt.rcParams["axes.unicode_minus"] = False
 
 
-def get_structure_supervision_weights(metric_names: Sequence[str]) -> List[float]:
-    return [float(STRUCTURE_SUPERVISION_WEIGHTS.get(name, 1.0)) for name in metric_names]
+def get_structure_supervision_weights(
+    metric_names: Sequence[str],
+    connectivity_weight: float | None = None,
+    path_reachability_weight: float | None = None,
+) -> List[float]:
+    weight_map = dict(STRUCTURE_SUPERVISION_WEIGHTS)
+    if connectivity_weight is not None:
+        weight_map["connectivity"] = float(connectivity_weight)
+    if path_reachability_weight is not None:
+        weight_map["path_reachability"] = float(path_reachability_weight)
+    return [float(weight_map.get(name, 1.0)) for name in metric_names]
 
 
 def draw_heightmap_with_coast(
@@ -602,7 +625,11 @@ def train_formal_vae(
         structure_dim=arrays["metric_matrix"].shape[1],
         structure_loss_weight=args.vae_structure_loss_weight,
         metric_alignment_loss_weight=args.vae_metric_alignment_loss_weight,
-        structure_loss_weights=get_structure_supervision_weights(structure_metric_names),
+        structure_loss_weights=get_structure_supervision_weights(
+            structure_metric_names,
+            connectivity_weight=args.vae_connectivity_supervision_weight,
+            path_reachability_weight=args.vae_path_reachability_supervision_weight,
+        ),
         land_recon_focus_weight=args.vae_land_recon_focus_weight,
         coast_recon_focus_weight=args.vae_coast_recon_focus_weight,
     ).to(device)
@@ -655,8 +682,18 @@ def train_formal_vae(
                 "structure_loss_weight": args.vae_structure_loss_weight,
                 "metric_alignment_loss_weight": args.vae_metric_alignment_loss_weight,
                 "structure_supervision_weights": {
-                    name: weight for name, weight in zip(structure_metric_names, get_structure_supervision_weights(structure_metric_names))
+                    name: weight
+                    for name, weight in zip(
+                        structure_metric_names,
+                        get_structure_supervision_weights(
+                            structure_metric_names,
+                            connectivity_weight=args.vae_connectivity_supervision_weight,
+                            path_reachability_weight=args.vae_path_reachability_supervision_weight,
+                        ),
+                    )
                 },
+                "connectivity_supervision_weight": args.vae_connectivity_supervision_weight,
+                "path_reachability_supervision_weight": args.vae_path_reachability_supervision_weight,
                 "land_recon_focus_weight": args.vae_land_recon_focus_weight,
                 "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
                 "learning_rate": args.vae_lr,
@@ -843,8 +880,17 @@ def save_trained_vae_artifacts(
                 "metric_alignment_loss_weight": args.vae_metric_alignment_loss_weight,
                 "structure_supervision_weights": {
                     name: weight
-                    for name, weight in zip(metric_names, get_structure_supervision_weights(metric_names))
+                    for name, weight in zip(
+                        metric_names,
+                        get_structure_supervision_weights(
+                            metric_names,
+                            connectivity_weight=args.vae_connectivity_supervision_weight,
+                            path_reachability_weight=args.vae_path_reachability_supervision_weight,
+                        ),
+                    )
                 },
+                "connectivity_supervision_weight": args.vae_connectivity_supervision_weight,
+                "path_reachability_supervision_weight": args.vae_path_reachability_supervision_weight,
                 "land_recon_focus_weight": args.vae_land_recon_focus_weight,
                 "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
             },
@@ -968,8 +1014,17 @@ def run_formal_vae_pipeline(
             "metric_alignment_loss_weight": args.vae_metric_alignment_loss_weight,
             "structure_supervision_weights": {
                 name: weight
-                for name, weight in zip(builder.evaluator.metric_names, get_structure_supervision_weights(builder.evaluator.metric_names))
+                for name, weight in zip(
+                    builder.evaluator.metric_names,
+                    get_structure_supervision_weights(
+                        builder.evaluator.metric_names,
+                        connectivity_weight=args.vae_connectivity_supervision_weight,
+                        path_reachability_weight=args.vae_path_reachability_supervision_weight,
+                    ),
+                )
             },
+            "connectivity_supervision_weight": args.vae_connectivity_supervision_weight,
+            "path_reachability_supervision_weight": args.vae_path_reachability_supervision_weight,
             "land_recon_focus_weight": args.vae_land_recon_focus_weight,
             "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
             "learning_rate": args.vae_lr,

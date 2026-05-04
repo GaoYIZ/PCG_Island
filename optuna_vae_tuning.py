@@ -37,8 +37,18 @@ STRUCTURE_WEIGHT_MAP = {
 }
 
 
-def get_structure_supervision_weights(metric_names: tuple[str, ...] = STRUCTURE_METRIC_NAMES) -> list[float]:
-    return [float(STRUCTURE_WEIGHT_MAP.get(name, 1.0)) for name in metric_names]
+def get_structure_supervision_weights(
+    metric_names: tuple[str, ...] = STRUCTURE_METRIC_NAMES,
+    *,
+    connectivity_weight: float | None = None,
+    path_reachability_weight: float | None = None,
+) -> list[float]:
+    weight_map = dict(STRUCTURE_WEIGHT_MAP)
+    if connectivity_weight is not None:
+        weight_map["connectivity"] = float(connectivity_weight)
+    if path_reachability_weight is not None:
+        weight_map["path_reachability"] = float(path_reachability_weight)
+    return [float(weight_map.get(name, 1.0)) for name in metric_names]
 
 
 def parse_args() -> argparse.Namespace:
@@ -197,6 +207,8 @@ def main() -> None:
         coast_dice_loss_weight = trial.suggest_float("coast_dice_loss_weight", 0.15, 0.50)
         structure_loss_weight = trial.suggest_float("structure_loss_weight", 0.10, 1.20)
         metric_alignment_loss_weight = trial.suggest_float("metric_alignment_loss_weight", 0.05, 1.20)
+        connectivity_supervision_weight = trial.suggest_float("connectivity_supervision_weight", 1.2, 4.0)
+        path_reachability_supervision_weight = trial.suggest_float("path_reachability_supervision_weight", 1.5, 5.0)
         land_recon_focus_weight = trial.suggest_float("land_recon_focus_weight", 1.2, 3.5)
         coast_recon_focus_weight = trial.suggest_float("coast_recon_focus_weight", 2.0, 5.5)
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 2e-3, log=True)
@@ -218,7 +230,10 @@ def main() -> None:
             structure_dim=train_metrics.shape[1],
             structure_loss_weight=structure_loss_weight,
             metric_alignment_loss_weight=metric_alignment_loss_weight,
-            structure_loss_weights=get_structure_supervision_weights(),
+            structure_loss_weights=get_structure_supervision_weights(
+                connectivity_weight=connectivity_supervision_weight,
+                path_reachability_weight=path_reachability_supervision_weight,
+            ),
             land_recon_focus_weight=land_recon_focus_weight,
             coast_recon_focus_weight=coast_recon_focus_weight,
         ).to(device)
@@ -255,7 +270,13 @@ def main() -> None:
             val_metrics=val_metrics,
         )
         clipped_r2 = np.clip(np.array(list(latent_predictive_r2.values()), dtype=np.float32), -1.5, 1.0)
-        metric_weight_vector = np.array(get_structure_supervision_weights(), dtype=np.float32)
+        metric_weight_vector = np.array(
+            get_structure_supervision_weights(
+                connectivity_weight=connectivity_supervision_weight,
+                path_reachability_weight=path_reachability_supervision_weight,
+            ),
+            dtype=np.float32,
+        )
         normalized_metric_weights = metric_weight_vector / metric_weight_vector.sum()
         predictive_penalty = float(np.sum(np.maximum(0.0, 0.60 - clipped_r2) * normalized_metric_weights))
         worst_case_penalty = float(np.max(np.maximum(0.0, 0.45 - clipped_r2) * metric_weight_vector))
