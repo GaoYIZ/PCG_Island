@@ -1,0 +1,23 @@
+{
+  "best_value": 0.13922180952598587,
+  "best_params": {
+    "beta": 0.05377816440933035,
+    "beta_start": 0.047478317761467256,
+    "free_bits": 0.012122201626912328,
+    "gradient_loss_weight": 0.2738134121458315,
+    "mask_loss_weight": 0.18472571569647456,
+    "coast_loss_weight": 0.3782106692118601,
+    "land_dice_loss_weight": 0.12560306475480748,
+    "coast_dice_loss_weight": 0.1570588538888043,
+    "structure_loss_weight": 1.1584867337451459,
+    "metric_alignment_loss_weight": 1.190098384590971,
+    "connectivity_supervision_weight": 1.2288743085499774,
+    "path_reachability_supervision_weight": 2.5009927011053406,
+    "land_recon_focus_weight": 3.4221280552286295,
+    "coast_recon_focus_weight": 2.9606069934857127,
+    "learning_rate": 0.0007219850959032655,
+    "warmup_epochs": 4,
+    "latent_dim": 64
+  },
+  "source": "formal_vae_latent64_3k_v3"
+}
