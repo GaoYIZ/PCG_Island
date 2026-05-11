@@ -35,10 +35,16 @@ class IslandDatasetBuilder:
         map_size: int = 128,
         scorer: Optional[MapScorer] = None,
         sampling_profile: str = "island",
+        path_sample_points: int = 6,
+        max_path_pairs: int = 8,
     ):
         self.map_size = map_size
         self.generator = PCGIslandGenerator(map_size=map_size)
-        self.evaluator = StructureEvaluator(map_size=map_size)
+        self.evaluator = StructureEvaluator(
+            map_size=map_size,
+            path_sample_points=path_sample_points,
+            max_path_pairs=max_path_pairs,
+        )
         self.scorer = scorer or MapScorer()
         self.sampling_profile = sampling_profile
         self.param_ranges = self.generator.get_param_ranges(map_size)

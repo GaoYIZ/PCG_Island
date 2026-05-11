@@ -49,7 +49,7 @@ STRUCTURE_SUPERVISION_WEIGHTS: Dict[str, float] = {
     "navigable_ratio": 1.3,
     "coast_complexity": 1.5,
     "terrain_variance": 1.0,
-    "path_reachability": 2.2,
+    "path_reachability": 3.2,
     "land_ratio": 0.8,
     "component_count": 1.8,
 }
@@ -63,6 +63,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-clean-samples", type=int, default=48, help="Minimum clean samples kept after filtering")
     parser.add_argument("--max-dataset-samples", type=int, default=480, help="Maximum raw samples allowed during dataset building")
     parser.add_argument("--sampling-profile", type=str, default="island", choices=["uniform", "island"], help="Parameter sampling strategy")
+    parser.add_argument(
+        "--drop-connectivity-supervision",
+        action="store_true",
+        help="Remove connectivity from VAE structure supervision while leaving dataset generation unchanged.",
+    )
+    parser.add_argument(
+        "--path-sample-points",
+        type=int,
+        default=10,
+        help="Representative navigable points sampled when estimating path_reachability.",
+    )
+    parser.add_argument(
+        "--max-path-pairs",
+        type=int,
+        default=20,
+        help="Maximum navigable point pairs tested when estimating path_reachability.",
+    )
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for VAE/PPO")
     parser.add_argument("--latent-dim", type=int, default=128, help="VAE latent dimension")
     parser.add_argument("--vae-epochs", type=int, default=30, help="VAE training epochs")
@@ -198,6 +215,13 @@ def apply_optuna_best_trial(args: argparse.Namespace) -> None:
         if source_name in best_params:
             setattr(args, target_name, best_params[source_name])
 
+    if "drop_connectivity_supervision" in trial_data:
+        args.drop_connectivity_supervision = bool(trial_data["drop_connectivity_supervision"])
+    if "path_sample_points" in trial_data:
+        args.path_sample_points = int(trial_data["path_sample_points"])
+    if "max_path_pairs" in trial_data:
+        args.max_path_pairs = int(trial_data["max_path_pairs"])
+
 
 def apply_fast_profile(args: argparse.Namespace) -> None:
     if not args.fast_profile:
@@ -320,6 +344,31 @@ def get_structure_supervision_weights(
     if path_reachability_weight is not None:
         weight_map["path_reachability"] = float(path_reachability_weight)
     return [float(weight_map.get(name, 1.0)) for name in metric_names]
+
+
+def get_selected_supervision_metric_names(
+    args: argparse.Namespace,
+    available_metric_names: Sequence[str],
+) -> Tuple[str, ...]:
+    metric_names = tuple(available_metric_names)
+    if args.drop_connectivity_supervision:
+        metric_names = tuple(name for name in metric_names if name != "connectivity")
+    if not metric_names:
+        raise ValueError("At least one supervision metric must remain enabled.")
+    return metric_names
+
+
+def select_supervision_metrics(
+    arrays: Dict[str, np.ndarray],
+    available_metric_names: Sequence[str],
+    selected_metric_names: Sequence[str],
+) -> Dict[str, np.ndarray]:
+    if tuple(available_metric_names) == tuple(selected_metric_names):
+        return arrays
+    selected_indices = [tuple(available_metric_names).index(name) for name in selected_metric_names]
+    selected_arrays = dict(arrays)
+    selected_arrays["supervision_metric_matrix"] = arrays["supervision_metric_matrix"][:, selected_indices]
+    return selected_arrays
 
 
 def draw_heightmap_with_coast(
@@ -544,7 +593,12 @@ def build_dataset(
     output_dir: Path,
 ) -> Tuple[IslandDatasetBuilder, List, Dict[str, np.ndarray], Dict[str, object]]:
     print_section("第一阶段：数据集构建 / 清洗 / 评估")
-    builder = IslandDatasetBuilder(map_size=args.map_size, sampling_profile=args.sampling_profile)
+    builder = IslandDatasetBuilder(
+        map_size=args.map_size,
+        sampling_profile=args.sampling_profile,
+        path_sample_points=args.path_sample_points,
+        max_path_pairs=args.max_path_pairs,
+    )
 
     raw_samples = []
     clean_samples = []
@@ -581,8 +635,12 @@ def build_dataset(
     print(f"\n采样轮数            : {round_index}")
     print(f"采样策略            : {args.sampling_profile}")
     print(f"目标清洗样本数      : {args.min_clean_samples}")
+    print(f"path sample points  : {args.path_sample_points}")
+    print(f"max path pairs      : {args.max_path_pairs}")
 
     arrays = builder.build_training_arrays(clean_samples)
+    selected_metric_names = get_selected_supervision_metric_names(args, builder.evaluator.supervision_metric_names)
+    arrays = select_supervision_metrics(arrays, builder.evaluator.supervision_metric_names, selected_metric_names)
     plot_dataset_samples(arrays["heightmaps"], output_dir / "dataset_samples.png")
     plot_ranked_maps(
         [sample.heightmap for sample in clean_samples],
@@ -714,6 +772,7 @@ def evaluate_vae_representation(
     latents: np.ndarray,
     output_dir: Path,
     device: torch.device,
+    metric_names: Sequence[str],
 ) -> Dict[str, object]:
     print_section("第四阶段：VAE 表征有效性评估")
 
@@ -730,11 +789,11 @@ def evaluate_vae_representation(
         output_dir / "vae_reconstruction.png",
     )
     original_metrics = arrays["supervision_metric_matrix"]
-    structure_metric_names = tuple(builder.evaluator.supervision_metric_names)
+    structure_metric_names = tuple(metric_names)
     land_mask, coast_band = build_focus_masks(arrays["heightmaps"])
     reconstructed_metrics = np.array(
         [
-            [builder.evaluator.evaluate(heightmap)[name] for name in builder.evaluator.supervision_metric_names]
+            [builder.evaluator.evaluate(heightmap)[name] for name in structure_metric_names]
             for heightmap in reconstructions
         ],
         dtype=np.float32,
@@ -798,7 +857,7 @@ def evaluate_vae_representation(
     else:
         predictive_r2 = {name: 0.0 for name in structure_metric_names}
 
-    land_index = builder.evaluator.metric_names.index("land_ratio")
+    land_index = structure_metric_names.index("land_ratio")
     plot_metric_bars(metric_mae, "VAE 结构指标重建误差", "平均绝对误差", output_dir / "vae_metric_mae.png")
     plot_metric_bars(
         structure_head_mae,
@@ -910,6 +969,7 @@ def run_formal_vae_pipeline(
     device: torch.device,
 ) -> Dict[str, object]:
     print_section("Formal VAE-only evaluation")
+    selected_metric_names = get_selected_supervision_metric_names(args, builder.evaluator.supervision_metric_names)
 
     train_idx, val_idx, test_idx = split_indices(
         num_samples=len(arrays["heightmaps"]),
@@ -932,7 +992,7 @@ def run_formal_vae_pipeline(
     vae, train_latents, history = train_formal_vae(
         args,
         split_arrays_map["train"],
-        builder.evaluator.supervision_metric_names,
+        selected_metric_names,
         train_dir,
         device,
     )
@@ -940,7 +1000,7 @@ def run_formal_vae_pipeline(
         split_clean_samples["train"],
         latent_matrix=train_latents,
     )
-    save_trained_vae_artifacts(args, vae, feature_normalizer, builder.evaluator.supervision_metric_names, output_dir)
+    save_trained_vae_artifacts(args, vae, feature_normalizer, selected_metric_names, output_dir)
 
     split_summaries: Dict[str, Dict[str, object]] = {}
     split_latents: Dict[str, np.ndarray] = {"train": train_latents}
@@ -964,6 +1024,7 @@ def run_formal_vae_pipeline(
             split_latents[split_name],
             split_dir,
             device,
+            metric_names=selected_metric_names,
         )
         split_summary["num_samples"] = int(len(split_indices_map[split_name]))
         split_summary["quality_score_mean"] = float(split_arrays_map[split_name]["quality_scores"].mean())
@@ -1013,22 +1074,25 @@ def run_formal_vae_pipeline(
             "coast_dice_loss_weight": args.vae_coast_dice_loss_weight,
             "structure_loss_weight": args.vae_structure_loss_weight,
             "metric_alignment_loss_weight": args.vae_metric_alignment_loss_weight,
-            "structure_supervision_weights": {
-                name: weight
-                for name, weight in zip(
-                    builder.evaluator.metric_names,
-                    get_structure_supervision_weights(
-                        builder.evaluator.metric_names,
-                        connectivity_weight=args.vae_connectivity_supervision_weight,
-                        path_reachability_weight=args.vae_path_reachability_supervision_weight,
-                    ),
-                )
-            },
-            "connectivity_supervision_weight": args.vae_connectivity_supervision_weight,
-            "path_reachability_supervision_weight": args.vae_path_reachability_supervision_weight,
-            "land_recon_focus_weight": args.vae_land_recon_focus_weight,
-            "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
-            "learning_rate": args.vae_lr,
+                "structure_supervision_weights": {
+                    name: weight
+                    for name, weight in zip(
+                        selected_metric_names,
+                        get_structure_supervision_weights(
+                            selected_metric_names,
+                            connectivity_weight=args.vae_connectivity_supervision_weight,
+                            path_reachability_weight=args.vae_path_reachability_supervision_weight,
+                        ),
+                    )
+                },
+                "connectivity_supervision_weight": args.vae_connectivity_supervision_weight,
+                "path_reachability_supervision_weight": args.vae_path_reachability_supervision_weight,
+                "drop_connectivity_supervision": bool(args.drop_connectivity_supervision),
+                "path_sample_points": int(args.path_sample_points),
+                "max_path_pairs": int(args.max_path_pairs),
+                "land_recon_focus_weight": args.vae_land_recon_focus_weight,
+                "coast_recon_focus_weight": args.vae_coast_recon_focus_weight,
+                "learning_rate": args.vae_lr,
         },
         "train_history_epochs": len(history),
     }
@@ -1407,6 +1471,9 @@ def main() -> None:
     print(f"???????????     : {args.min_clean_samples}")
     print(f"???????????      : {args.max_dataset_samples}")
     print(f"??????            : {args.sampling_profile}")
+    print(f"drop connectivity  : {args.drop_connectivity_supervision}")
+    print(f"path sample points : {args.path_sample_points}")
+    print(f"max path pairs     : {args.max_path_pairs}")
     print(f"VAE ??????        : {args.vae_epochs}")
     print(f"PPO ??????        : {args.ppo_episodes}")
     print(f"SAC ??????        : {args.sac_episodes}")
@@ -1459,7 +1526,8 @@ def main() -> None:
         print(f"RL ????????      : {final_summary['state_definition']['state_dim']}")
         return
 
-    vae, latents, _ = train_formal_vae(args, arrays, builder.evaluator.supervision_metric_names, output_dir, device)
+    selected_metric_names = get_selected_supervision_metric_names(args, builder.evaluator.supervision_metric_names)
+    vae, latents, _ = train_formal_vae(args, arrays, selected_metric_names, output_dir, device)
 
     print_section("第三阶段：特征归一化拟合")
     metric_names = builder.evaluator.metric_names
@@ -1470,7 +1538,16 @@ def main() -> None:
     print(f"结构指标维度        : {len(metric_names)}")
     print(f"latent 维度         : {latents.shape[1]}")
 
-    vae_summary = evaluate_vae_representation(args, builder, arrays, vae, latents, output_dir, device)
+    vae_summary = evaluate_vae_representation(
+        args,
+        builder,
+        arrays,
+        vae,
+        latents,
+        output_dir,
+        device,
+        metric_names=selected_metric_names,
+    )
 
     if args.skip_rl:
         final_summary: Dict[str, object] = {
