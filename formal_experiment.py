@@ -1139,6 +1139,8 @@ def build_env_factory(
             feature_normalizer=feature_normalizer,
             include_latent=True,
             sampling_profile=args.sampling_profile,
+            path_sample_points=args.path_sample_points,
+            max_path_pairs=args.max_path_pairs,
         )
 
     return factory

@@ -31,6 +31,8 @@ class IslandGenerationEnv(gym.Env):
         include_latent: bool = True,
         action_step_scale: float = 0.15,
         sampling_profile: str = "island",
+        path_sample_points: int = 10,
+        max_path_pairs: int = 20,
     ):
         super().__init__()
 
@@ -40,7 +42,11 @@ class IslandGenerationEnv(gym.Env):
         self.include_latent = include_latent and vae_model is not None
 
         self.generator = PCGIslandGenerator(map_size=map_size)
-        self.evaluator = StructureEvaluator(map_size=map_size)
+        self.evaluator = StructureEvaluator(
+            map_size=map_size,
+            path_sample_points=path_sample_points,
+            max_path_pairs=max_path_pairs,
+        )
         self.scorer = scorer or MapScorer()
         self.sampling_profile = sampling_profile
 
@@ -79,6 +85,7 @@ class IslandGenerationEnv(gym.Env):
         self.steps = 0
         self.history_buffer: list[np.ndarray] = []
         self.buffer_size = 100
+        self.current_score = None
 
     def reset(
         self,
@@ -92,19 +99,28 @@ class IslandGenerationEnv(gym.Env):
         self.current_heightmap = self.generator.generate_heightmap(self.current_params)
         self.current_metrics = self.evaluator.evaluate(self.current_heightmap)
         self.current_latent = self._encode_latent(self.current_heightmap)
+        self.history_buffer = []
         self.steps = 0
 
+        novelty_vector = self._get_novelty_vector()
+        self.current_score = self.scorer.score_metrics(
+            self.current_metrics,
+            feature_vector=novelty_vector,
+            history_vectors=self.history_buffer,
+        )
         state = self._get_state()
         info = {
             "metrics": dict(self.current_metrics),
             "params": dict(self.current_params),
-            "score": self.scorer.score_metrics(self.current_metrics).as_dict(),
+            "score": self.current_score.as_dict(),
         }
         return state, info
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
         if self.current_params is None:
             raise RuntimeError("Environment must be reset before step().")
+        if self.current_score is None:
+            raise RuntimeError("Environment score state was not initialized. Call reset() first.")
 
         self.steps += 1
         self.current_params = self.param_normalizer.apply_normalized_delta(self.current_params, action)
@@ -120,11 +136,17 @@ class IslandGenerationEnv(gym.Env):
             feature_vector=novelty_vector,
             history_vectors=self.history_buffer,
         )
+        reward, reward_terms = self.scorer.transition_reward(
+            previous_score=self.current_score,
+            current_score=score,
+            metrics=self.current_metrics,
+        )
 
         if novelty_vector is not None:
             if len(self.history_buffer) >= self.buffer_size:
                 self.history_buffer.pop(0)
             self.history_buffer.append(novelty_vector.copy())
+        self.current_score = score
 
         terminated = self.steps >= self.max_steps
         truncated = False
@@ -134,9 +156,10 @@ class IslandGenerationEnv(gym.Env):
             "metrics": dict(self.current_metrics),
             "params": dict(self.current_params),
             "score": score.as_dict(),
+            "reward_terms": reward_terms,
             "heightmap": self.current_heightmap,
         }
-        return state, float(score.total_score), terminated, truncated, info
+        return state, float(reward), terminated, truncated, info
 
     def render(self, mode: str = "human") -> None:
         if mode == "human" and self.current_metrics is not None:

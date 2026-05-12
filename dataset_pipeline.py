@@ -35,8 +35,8 @@ class IslandDatasetBuilder:
         map_size: int = 128,
         scorer: Optional[MapScorer] = None,
         sampling_profile: str = "island",
-        path_sample_points: int = 6,
-        max_path_pairs: int = 8,
+        path_sample_points: int = 10,
+        max_path_pairs: int = 20,
     ):
         self.map_size = map_size
         self.generator = PCGIslandGenerator(map_size=map_size)
@@ -201,16 +201,17 @@ class IslandDatasetBuilder:
 
     def _collect_rejection_reasons(self, metrics: Dict[str, float], score: float) -> List[str]:
         reasons: List[str] = []
-        if metrics["land_ratio"] < 0.10:
+        thresholds = self.scorer.constraint_thresholds
+        if metrics["land_ratio"] < thresholds["land_ratio_min"]:
             reasons.append("too_little_land")
-        if metrics["land_ratio"] > 0.60:
+        if metrics["land_ratio"] > thresholds["land_ratio_max"]:
             reasons.append("too_much_land")
-        if metrics["connectivity"] < 0.90:
+        if metrics["connectivity"] < thresholds["connectivity"]:
             reasons.append("weak_connectivity")
-        if metrics["path_reachability"] < 0.25:
+        if metrics["path_reachability"] < thresholds["path_reachability"]:
             reasons.append("poor_reachability")
-        if metrics["terrain_variance"] < 0.04:
+        if metrics["terrain_variance"] < thresholds["terrain_variance"]:
             reasons.append("too_flat")
-        if score < 0.45:
+        if score < thresholds["quality_score"]:
             reasons.append("low_quality_score")
         return reasons

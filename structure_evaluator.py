@@ -47,8 +47,8 @@ class StructureEvaluator:
         slope_threshold: float = 30.0,
         height_scale: float = 3.5,
         cell_size: float = 1.0,
-        path_sample_points: int = 6,
-        max_path_pairs: int = 8,
+        path_sample_points: int = 10,
+        max_path_pairs: int = 20,
         slope_cost_weight: float = 0.35,
     ):
         self.map_size = map_size

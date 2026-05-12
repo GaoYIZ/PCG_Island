@@ -18,6 +18,8 @@ class ScoreBreakdown:
     land_score: float
     novelty_score: float
     component_scores: Dict[str, float]
+    constraint_penalty: float = 0.0
+    quality_bonus: float = 0.0
 
     def as_dict(self) -> Dict[str, float]:
         data = {
@@ -26,6 +28,8 @@ class ScoreBreakdown:
             "path_score": self.path_score,
             "land_score": self.land_score,
             "novelty_score": self.novelty_score,
+            "constraint_penalty": self.constraint_penalty,
+            "quality_bonus": self.quality_bonus,
         }
         data.update(self.component_scores)
         return data
@@ -43,8 +47,18 @@ class MapScorer:
 
     def __init__(
         self,
+        preferred_ranges: Optional[Mapping[str, Mapping[str, float]]] = None,
+        structure_weights: Optional[Mapping[str, float]] = None,
+        total_weights: Optional[Mapping[str, float]] = None,
         novelty_scale: float = 0.35,
         novelty_k: int = 5,
+        reward_delta_scale: float = 5.0,
+        quality_bonus_threshold: float = 0.85,
+        excellent_bonus_threshold: float = 0.92,
+        quality_bonus: float = 0.50,
+        excellent_bonus: float = 1.00,
+        constraint_thresholds: Optional[Mapping[str, float]] = None,
+        constraint_penalties: Optional[Mapping[str, float]] = None,
     ):
         self.preferred_ranges = {
             "navigable_ratio": {
@@ -60,35 +74,69 @@ class MapScorer:
                 "maximum": 10.50,
             },
             "terrain_variance": {
-                "minimum": 0.03,
+                "minimum": 0.04,
                 "ideal_low": 0.08,
                 "ideal_high": 0.18,
                 "maximum": 0.28,
             },
             "land_ratio": {
-                "minimum": 0.08,
+                "minimum": 0.10,
                 "ideal_low": 0.18,
                 "ideal_high": 0.42,
-                "maximum": 0.62,
+                "maximum": 0.60,
             },
         }
         self.structure_weights = {
-            "connectivity": 0.30,
-            "navigable_ratio": 0.25,
-            "coast_complexity": 0.20,
-            "terrain_variance": 0.25,
+            "connectivity": 0.40,
+            "navigable_ratio": 0.30,
+            "coast_complexity": 0.15,
+            "terrain_variance": 0.15,
         }
         self.total_weights = {
-            "structure": 0.45,
-            "path": 0.20,
-            "land": 0.25,
-            "novelty": 0.10,
+            "structure": 0.60,
+            "path": 0.25,
+            "land": 0.10,
+            "novelty": 0.05,
         }
+        self.preferred_ranges.update({key: dict(value) for key, value in (preferred_ranges or {}).items()})
+        self.structure_weights.update({key: float(value) for key, value in (structure_weights or {}).items()})
+        self.total_weights.update({key: float(value) for key, value in (total_weights or {}).items()})
         self.novelty_scale = float(novelty_scale)
         self.novelty_k = int(max(1, novelty_k))
+        self.reward_delta_scale = float(reward_delta_scale)
+        self.quality_bonus_threshold = float(quality_bonus_threshold)
+        self.excellent_bonus_threshold = float(excellent_bonus_threshold)
+        self.quality_bonus_value = float(quality_bonus)
+        self.excellent_bonus_value = float(excellent_bonus)
+        self.constraint_thresholds = {
+            "connectivity": 0.90,
+            "path_reachability": 0.25,
+            "land_ratio_min": 0.10,
+            "land_ratio_max": 0.60,
+            "navigable_ratio": 0.70,
+            "terrain_variance": 0.04,
+            "quality_score": 0.50,
+        }
+        self.constraint_penalties = {
+            "connectivity": 1.25,
+            "path_reachability": 1.25,
+            "land_ratio": 0.75,
+            "navigable_ratio": 0.50,
+            "terrain_variance": 0.25,
+        }
+        if constraint_thresholds is not None:
+            self.constraint_thresholds.update({key: float(value) for key, value in constraint_thresholds.items()})
+        if constraint_penalties is not None:
+            self.constraint_penalties.update({key: float(value) for key, value in constraint_penalties.items()})
 
     @staticmethod
+    def _smoothstep(t: float) -> float:
+        clipped = float(np.clip(t, 0.0, 1.0))
+        return clipped * clipped * (3.0 - 2.0 * clipped)
+
+    @classmethod
     def _band_score(
+        cls,
         value: float,
         minimum: float,
         ideal_low: float,
@@ -102,10 +150,10 @@ class MapScorer:
         if value < ideal_low:
             if ideal_low <= minimum + 1e-8:
                 return 1.0
-            return float((value - minimum) / max(ideal_low - minimum, 1e-8))
+            return cls._smoothstep((value - minimum) / max(ideal_low - minimum, 1e-8))
         if maximum <= ideal_high + 1e-8:
             return 1.0
-        return float((maximum - value) / max(maximum - ideal_high, 1e-8))
+        return cls._smoothstep((maximum - value) / max(maximum - ideal_high, 1e-8))
 
     def describe(self) -> Dict[str, object]:
         return {
@@ -114,6 +162,13 @@ class MapScorer:
             "total_weights": self.total_weights,
             "novelty_scale": self.novelty_scale,
             "novelty_k": self.novelty_k,
+            "reward_delta_scale": self.reward_delta_scale,
+            "quality_bonus_threshold": self.quality_bonus_threshold,
+            "excellent_bonus_threshold": self.excellent_bonus_threshold,
+            "quality_bonus": self.quality_bonus_value,
+            "excellent_bonus": self.excellent_bonus_value,
+            "constraint_thresholds": self.constraint_thresholds,
+            "constraint_penalties": self.constraint_penalties,
         }
 
     def compute_novelty_score(
@@ -200,3 +255,52 @@ class MapScorer:
             novelty_score=float(novelty_score),
             component_scores=component_scores,
         )
+
+    def compute_constraint_penalty(self, metrics: Mapping[str, float]) -> float:
+        penalty = 0.0
+        if float(metrics["connectivity"]) < self.constraint_thresholds["connectivity"]:
+            penalty += self.constraint_penalties["connectivity"]
+        if float(metrics["path_reachability"]) < self.constraint_thresholds["path_reachability"]:
+            penalty += self.constraint_penalties["path_reachability"]
+        land_ratio = float(metrics["land_ratio"])
+        if (
+            land_ratio < self.constraint_thresholds["land_ratio_min"]
+            or land_ratio > self.constraint_thresholds["land_ratio_max"]
+        ):
+            penalty += self.constraint_penalties["land_ratio"]
+        if float(metrics["navigable_ratio"]) < self.constraint_thresholds["navigable_ratio"]:
+            penalty += self.constraint_penalties["navigable_ratio"]
+        if float(metrics["terrain_variance"]) < self.constraint_thresholds["terrain_variance"]:
+            penalty += self.constraint_penalties["terrain_variance"]
+        return float(penalty)
+
+    def compute_quality_bonus(self, total_score: float) -> float:
+        bonus = 0.0
+        if total_score >= self.quality_bonus_threshold:
+            bonus += self.quality_bonus_value
+        if total_score >= self.excellent_bonus_threshold:
+            bonus += self.excellent_bonus_value
+        return float(bonus)
+
+    def transition_reward(
+        self,
+        previous_score: ScoreBreakdown,
+        current_score: ScoreBreakdown,
+        metrics: Mapping[str, float],
+    ) -> tuple[float, Dict[str, float]]:
+        delta_quality = float(current_score.total_score - previous_score.total_score)
+        penalty = self.compute_constraint_penalty(metrics)
+        bonus = self.compute_quality_bonus(current_score.total_score)
+        reward = self.reward_delta_scale * delta_quality - penalty + bonus
+        reward_terms = {
+            "delta_quality": delta_quality,
+            "reward_delta_scale": self.reward_delta_scale,
+            "constraint_penalty": penalty,
+            "quality_bonus": bonus,
+            "previous_total_score": float(previous_score.total_score),
+            "current_total_score": float(current_score.total_score),
+            "shaped_reward": float(reward),
+        }
+        current_score.constraint_penalty = penalty
+        current_score.quality_bonus = bonus
+        return float(reward), reward_terms
