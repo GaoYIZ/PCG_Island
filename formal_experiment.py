@@ -1404,6 +1404,7 @@ def evaluate_agent(
             "reward": float(episode_reward),
             "metrics": {key: float(value) for key, value in info["metrics"].items()},
             "score": {key: float(value) for key, value in info["score"].items()},
+            "reward_terms": {key: float(value) for key, value in info.get("reward_terms", {}).items()},
         }
         records.append(record)
 
