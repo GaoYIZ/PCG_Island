@@ -1172,8 +1172,10 @@ def run_formal_rl_experiment(
     zero_summary = evaluate_agent("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
     random_summary = evaluate_agent("Random", random_policy, env_factory, output_dir, args.eval_islands, args.seed + 1500)
 
-    ppo_agent, _, _ = train_ppo(args, env_factory, output_dir, device)
-    ppo_summary = evaluate_agent("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000)
+    ppo_summary = None
+    if args.ppo_episodes > 0:
+        ppo_agent, _, _ = train_ppo(args, env_factory, output_dir, device)
+        ppo_summary = evaluate_agent("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000)
 
     sac_summary = None
     if args.sac_episodes > 0:
@@ -1183,8 +1185,9 @@ def run_formal_rl_experiment(
     policy_summaries = {
         "Zero": zero_summary,
         "Random": random_summary,
-        "PPO": ppo_summary,
     }
+    if ppo_summary is not None:
+        policy_summaries["PPO"] = ppo_summary
     if sac_summary is not None:
         policy_summaries["SAC"] = sac_summary
 
@@ -1204,6 +1207,7 @@ def run_formal_rl_experiment(
         "zero_summary": zero_summary,
         "random_summary": random_summary,
         "ppo_summary": ppo_summary,
+        "ppo_skipped": bool(args.ppo_episodes <= 0),
     }
     if sac_summary is not None:
         final_summary["sac_summary"] = sac_summary
@@ -1578,14 +1582,17 @@ def main() -> None:
     zero_summary = evaluate_agent("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
     random_summary = evaluate_agent("Random", random_policy, env_factory, output_dir, args.eval_islands, args.seed + 1500)
 
-    ppo_agent, _, _ = train_ppo(args, env_factory, output_dir, device)
-    ppo_summary = evaluate_agent("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000)
+    ppo_summary = None
+    if args.ppo_episodes > 0:
+        ppo_agent, _, _ = train_ppo(args, env_factory, output_dir, device)
+        ppo_summary = evaluate_agent("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000)
 
     policy_summaries = {
         "Zero": zero_summary,
         "Random": random_summary,
-        "PPO": ppo_summary,
     }
+    if ppo_summary is not None:
+        policy_summaries["PPO"] = ppo_summary
 
     final_summary: Dict[str, object] = {
         "清洗后有效样本数": clean_summary["num_valid"],
@@ -1595,6 +1602,7 @@ def main() -> None:
         "VAE 表征评估": vae_summary,
         "策略对比": compare_policy_summaries(policy_summaries),
         "PPO 评估总结": ppo_summary,
+        "PPO 已跳过": bool(args.ppo_episodes <= 0),
     }
 
     if args.sac_episodes > 0:
