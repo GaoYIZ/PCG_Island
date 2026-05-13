@@ -377,20 +377,82 @@ def draw_heightmap_with_coast(
     axis.axis("off")
 
 
-def plot_curve(values: Sequence[float], title: str, ylabel: str, output_path: Path) -> None:
-    plt.figure(figsize=(10, 5))
-    plt.plot(values, linewidth=2, alpha=0.85)
+def _draw_curve_on_axis(axis, values: Sequence[float], title: str, ylabel: str) -> None:
+    axis.clear()
+    axis.plot(values, linewidth=2, alpha=0.85)
     if len(values) >= 10:
         moving_average = np.convolve(values, np.ones(10) / 10, mode="valid")
-        plt.plot(range(9, len(values)), moving_average, linewidth=2, color="red", label="10轮滑动均值")
-        plt.legend()
-    plt.title(title)
-    plt.xlabel("轮次")
-    plt.ylabel(ylabel)
-    plt.grid(True, alpha=0.3)
+        axis.plot(range(9, len(values)), moving_average, linewidth=2, color="red", label="10轮滑动均值")
+        axis.legend()
+    axis.set_title(title)
+    axis.set_xlabel("轮次")
+    axis.set_ylabel(ylabel)
+    axis.grid(True, alpha=0.3)
+
+
+def plot_curve(values: Sequence[float], title: str, ylabel: str, output_path: Path) -> None:
+    plt.figure(figsize=(10, 5))
+    axis = plt.gca()
+    _draw_curve_on_axis(axis, values, title, ylabel)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
+
+
+class LiveCurvePlotter:
+    """Keeps a reward curve figure refreshed during training and mirrors it to disk."""
+
+    def __init__(
+        self,
+        title: str,
+        ylabel: str,
+        output_path: Path,
+        refresh_every: int = 1,
+    ) -> None:
+        self.title = title
+        self.ylabel = ylabel
+        self.output_path = output_path
+        self.refresh_every = max(1, int(refresh_every))
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.figure = None
+        self.axis = None
+        self.interactive = False
+        try:
+            plt.ion()
+            self.figure, self.axis = plt.subplots(figsize=(10, 5))
+            self.interactive = True
+        except Exception:
+            self.figure = None
+            self.axis = None
+            self.interactive = False
+
+    def update(self, values: Sequence[float], force: bool = False) -> None:
+        if not values:
+            return
+        if not force and len(values) % self.refresh_every != 0:
+            return
+
+        if self.interactive and self.figure is not None and self.axis is not None:
+            _draw_curve_on_axis(self.axis, values, self.title, self.ylabel)
+            self.figure.tight_layout()
+            self.figure.savefig(self.output_path, dpi=150, bbox_inches="tight")
+            try:
+                self.figure.canvas.draw_idle()
+                self.figure.canvas.flush_events()
+                plt.pause(0.001)
+            except Exception:
+                pass
+        else:
+            plot_curve(values, self.title, self.ylabel, self.output_path)
+
+    def close(self, values: Sequence[float]) -> None:
+        self.update(values, force=True)
+        if self.interactive and self.figure is not None:
+            try:
+                plt.close(self.figure)
+            except Exception:
+                pass
 
 
 def plot_dataset_samples(heightmaps: np.ndarray, output_path: Path, num_samples: int = 9) -> None:
@@ -1209,6 +1271,14 @@ def train_ppo(
 ) -> Tuple[PPOAgent, List[float], List[dict]]:
     print_section("第五阶段：PPO 正式训练")
     env = env_factory()
+    curve_path = output_dir / "ppo_training_curve.png"
+    live_plotter = LiveCurvePlotter(
+        title="PPO 训练奖励曲线",
+        ylabel="奖励值",
+        output_path=curve_path,
+        refresh_every=1,
+    )
+    print(f"PPO 实时奖励曲线: {curve_path.resolve()}")
     agent = PPOAgent(
         state_dim=env.observation_space.shape[0],
         action_dim=env.action_space.shape[0],
@@ -1249,6 +1319,7 @@ def train_ppo(
                 "score": last_info["score"] if last_info is not None else {},
             }
         )
+        live_plotter.update(episode_rewards)
 
         if (episode + 1) % 10 == 0 or episode == 0:
             print(
@@ -1257,12 +1328,7 @@ def train_ppo(
                 f"最近10轮平均奖励 {np.mean(episode_rewards[-10:]):.4f}"
             )
 
-    plot_curve(
-        episode_rewards,
-        title="PPO 训练奖励曲线",
-        ylabel="奖励值",
-        output_path=output_dir / "ppo_training_curve.png",
-    )
+    live_plotter.close(episode_rewards)
     torch.save(agent.network.state_dict(), output_dir / "ppo_agent.pth")
     save_json(
         {
@@ -1282,6 +1348,14 @@ def train_sac(
 ) -> Tuple[SACAgent, List[float]]:
     print_section("补充阶段：SAC 训练")
     env = env_factory()
+    curve_path = output_dir / "sac_training_curve.png"
+    live_plotter = LiveCurvePlotter(
+        title="SAC 训练奖励曲线",
+        ylabel="奖励值",
+        output_path=curve_path,
+        refresh_every=1,
+    )
+    print(f"SAC 实时奖励曲线: {curve_path.resolve()}")
     agent = SACAgent(
         state_dim=env.observation_space.shape[0],
         action_dim=env.action_space.shape[0],
@@ -1309,6 +1383,7 @@ def train_sac(
                 break
 
         episode_rewards.append(float(episode_reward))
+        live_plotter.update(episode_rewards)
         if (episode + 1) % 10 == 0 or episode == 0:
             print(
                 f"第 {episode + 1:>3} 轮 / {args.sac_episodes} 轮 | "
@@ -1316,12 +1391,7 @@ def train_sac(
                 f"最近10轮平均奖励 {np.mean(episode_rewards[-10:]):.4f}"
             )
 
-    plot_curve(
-        episode_rewards,
-        title="SAC 训练奖励曲线",
-        ylabel="奖励值",
-        output_path=output_dir / "sac_training_curve.png",
-    )
+    live_plotter.close(episode_rewards)
     agent.save(output_dir / "sac_agent.pth")
     save_json(
         {"reward_summary": summarize_rewards(episode_rewards)},
