@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-samples", type=int, default=120, help="每轮数据采样量")
     parser.add_argument("--min-clean-samples", type=int, default=64, help="最少保留样本数")
     parser.add_argument("--max-dataset-samples", type=int, default=480, help="最大原始样本数")
-    parser.add_argument("--sampling-profile", type=str, default="island", choices=["uniform", "island"])
+    parser.add_argument("--sampling-profile", type=str, default="island", choices=["uniform", "island", "island_voronoi"])
     parser.add_argument(
         "--drop-connectivity-supervision",
         action="store_true",

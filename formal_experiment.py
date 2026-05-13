@@ -62,7 +62,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-samples", type=int, default=120, help="Raw samples generated per sampling round")
     parser.add_argument("--min-clean-samples", type=int, default=48, help="Minimum clean samples kept after filtering")
     parser.add_argument("--max-dataset-samples", type=int, default=480, help="Maximum raw samples allowed during dataset building")
-    parser.add_argument("--sampling-profile", type=str, default="island", choices=["uniform", "island"], help="Parameter sampling strategy")
+    parser.add_argument(
+        "--sampling-profile",
+        type=str,
+        default="island",
+        choices=["uniform", "island", "island_voronoi"],
+        help="Parameter sampling strategy",
+    )
     parser.add_argument(
         "--drop-connectivity-supervision",
         action="store_true",

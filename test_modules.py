@@ -53,6 +53,18 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertLessEqual(float(low_amp.max()), 1.0)
         self.assertNotAlmostEqual(float(low_amp.std()), float(high_amp.std()), places=3)
 
+    def test_voronoi_profile_adds_scaffold_parameters(self) -> None:
+        rng = np.random.default_rng(123)
+        params = self.generator.sample_random_params(rng, profile="island_voronoi")
+        heightmap = self.generator.generate_heightmap(params)
+
+        self.assertIn("voronoi_weight", params)
+        self.assertIn("voronoi_cells", params)
+        self.assertIn("voronoi_sharpness", params)
+        self.assertEqual(heightmap.shape, (64, 64))
+        self.assertGreaterEqual(float(heightmap.min()), 0.0)
+        self.assertLessEqual(float(heightmap.max()), 1.0)
+
     def test_structure_evaluator_reports_size_metric(self) -> None:
         heightmap = self.generator.generate_heightmap(self.generator.sample_random_params(np.random.default_rng(1)))
         metrics = self.evaluator.evaluate(heightmap)
@@ -124,6 +136,17 @@ class IslandPipelineTests(unittest.TestCase):
             len(builder.evaluator.supervision_metric_names),
         )
         self.assertIn("component_count", builder.evaluator.supervision_metric_names)
+
+    def test_dataset_builder_voronoi_profile_expands_parameter_space(self) -> None:
+        builder = IslandDatasetBuilder(map_size=64, scorer=self.scorer, sampling_profile="island_voronoi")
+        raw_samples = builder.generate_samples(n_samples=4, seed=321)
+        clean_samples = builder.clean_samples(raw_samples)
+        arrays = builder.build_training_arrays(clean_samples)
+
+        self.assertIn("voronoi_weight", builder.param_normalizer.param_names)
+        self.assertIn("voronoi_cells", builder.param_normalizer.param_names)
+        self.assertIn("voronoi_sharpness", builder.param_normalizer.param_names)
+        self.assertEqual(arrays["normalized_params"].shape[1], len(builder.param_normalizer.param_names))
 
     def test_supervision_selection_can_drop_connectivity(self) -> None:
         class Args:

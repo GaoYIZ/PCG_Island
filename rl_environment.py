@@ -44,7 +44,7 @@ class IslandGenerationEnv(gym.Env):
         self.scorer = scorer or MapScorer()
         self.sampling_profile = sampling_profile
 
-        self.param_ranges = self.generator.get_param_ranges(map_size)
+        self.param_ranges = self.generator.get_param_ranges(map_size, profile=sampling_profile)
         self.param_normalizer = ParameterSpaceNormalizer(
             param_ranges=self.param_ranges,
             step_scale=action_step_scale,

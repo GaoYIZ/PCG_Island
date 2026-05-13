@@ -59,12 +59,18 @@ class SimplexNoise:
 class PCGIslandGenerator:
     """Generates normalized island heightmaps from parameterized noise."""
 
+    VORONOI_DEFAULTS = {
+        "voronoi_weight": 0.0,
+        "voronoi_cells": 14,
+        "voronoi_sharpness": 1.6,
+    }
+
     def __init__(self, map_size: int = 128):
         self.map_size = map_size
         self.noise = SimplexNoise(seed=42)
 
     @staticmethod
-    def get_param_ranges(map_size: int) -> Dict[str, tuple[float, float]]:
+    def _base_param_ranges(map_size: int) -> Dict[str, tuple[float, float]]:
         return {
             "f": (1.0, 100.0),
             "A": (0.5, 2.0),
@@ -78,8 +84,28 @@ class PCGIslandGenerator:
         }
 
     @classmethod
+    def get_param_ranges(
+        cls,
+        map_size: int,
+        profile: str = "uniform",
+    ) -> Dict[str, tuple[float, float]]:
+        ranges = dict(cls._base_param_ranges(map_size))
+        if profile in {"uniform", "island"}:
+            return ranges
+        if profile == "island_voronoi":
+            ranges.update(
+                {
+                    "voronoi_weight": (0.12, 0.42),
+                    "voronoi_cells": (8.0, 24.0),
+                    "voronoi_sharpness": (0.8, 2.8),
+                }
+            )
+            return ranges
+        raise ValueError(f"Unsupported parameter profile: {profile}")
+
+    @classmethod
     def get_sampling_ranges(cls, map_size: int, profile: str = "uniform") -> Dict[str, tuple[float, float]]:
-        base_ranges = cls.get_param_ranges(map_size)
+        base_ranges = cls._base_param_ranges(map_size)
         if profile == "uniform":
             return base_ranges
         if profile == "island":
@@ -94,6 +120,16 @@ class PCGIslandGenerator:
                 "falloff_radius": (map_size * 0.24, map_size * 0.48),
                 "falloff_exponent": (1.60, 3.20),
             }
+        if profile == "island_voronoi":
+            ranges = cls.get_sampling_ranges(map_size, profile="island")
+            ranges.update(
+                {
+                    "voronoi_weight": (0.12, 0.42),
+                    "voronoi_cells": (8.0, 24.0),
+                    "voronoi_sharpness": (0.8, 2.8),
+                }
+            )
+            return ranges
         raise ValueError(f"Unsupported sampling profile: {profile}")
 
     def sample_random_params(
@@ -112,7 +148,7 @@ class PCGIslandGenerator:
         return params
 
     def generate_heightmap(self, params: Dict[str, float]) -> np.ndarray:
-        param_ranges = self.get_param_ranges(self.map_size)
+        param_ranges = self._base_param_ranges(self.map_size)
         defaults = {name: (low + high) * 0.5 for name, (low, high) in param_ranges.items()}
 
         frequency = float(params.get("f", defaults["f"]))
@@ -125,6 +161,9 @@ class PCGIslandGenerator:
         warp_frequency = float(params.get("warp_frequency", defaults["warp_frequency"]))
         falloff_radius = float(params.get("falloff_radius", defaults["falloff_radius"]))
         falloff_exponent = float(params.get("falloff_exponent", defaults["falloff_exponent"]))
+        voronoi_weight = float(params.get("voronoi_weight", self.VORONOI_DEFAULTS["voronoi_weight"]))
+        voronoi_cells = int(round(params.get("voronoi_cells", self.VORONOI_DEFAULTS["voronoi_cells"])))
+        voronoi_sharpness = float(params.get("voronoi_sharpness", self.VORONOI_DEFAULTS["voronoi_sharpness"]))
 
         self.noise = SimplexNoise(seed=seed)
 
@@ -137,6 +176,13 @@ class PCGIslandGenerator:
         if warp_strength > 0.0:
             heightmap = self._domain_warping(heightmap, strength=warp_strength, frequency=warp_frequency)
         heightmap = self._normalize(heightmap)
+        if voronoi_weight > 0.0:
+            voronoi_map = self._voronoi_scaffold(
+                cell_count=voronoi_cells,
+                sharpness=voronoi_sharpness,
+                seed=seed + 7919,
+            )
+            heightmap = self._normalize((1.0 - voronoi_weight) * heightmap + voronoi_weight * voronoi_map)
 
         heightmap = np.clip(0.5 + (heightmap - 0.5) * amplitude_scale, 0.0, 1.0)
         heightmap = self._radial_falloff(heightmap, radius=falloff_radius, exponent=falloff_exponent)
@@ -194,6 +240,36 @@ class PCGIslandGenerator:
                 falloff_map[y, x] = 1.0 - min(1.0, normalized_distance**exponent)
 
         return heightmap * falloff_map
+
+    def _voronoi_scaffold(
+        self,
+        cell_count: int,
+        sharpness: float,
+        seed: int,
+    ) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        cell_count = max(3, int(cell_count))
+
+        grid_y, grid_x = np.mgrid[0 : self.map_size, 0 : self.map_size].astype(np.float32)
+        seeds = rng.uniform(0.0, float(self.map_size), size=(cell_count, 2)).astype(np.float32)
+
+        dx = grid_x[None, :, :] - seeds[:, 0][:, None, None]
+        dy = grid_y[None, :, :] - seeds[:, 1][:, None, None]
+        distances = np.sqrt(dx * dx + dy * dy)
+
+        nearest_two = np.partition(distances, kth=1, axis=0)[:2]
+        nearest = nearest_two[0]
+        second = nearest_two[1]
+
+        ridge_strength = np.clip(second - nearest, 0.0, None)
+        ridge_strength /= float(ridge_strength.max() + 1e-8)
+
+        center_bias = 1.0 - nearest / float(nearest.max() + 1e-8)
+        center_bias = np.clip(center_bias, 0.0, 1.0)
+
+        scaffold = 0.65 * center_bias + 0.35 * ridge_strength
+        scaffold = np.clip(scaffold, 0.0, 1.0) ** max(0.25, float(sharpness))
+        return self._normalize(scaffold.astype(np.float32))
 
     @staticmethod
     def _normalize(heightmap: np.ndarray) -> np.ndarray:

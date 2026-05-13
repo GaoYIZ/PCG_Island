@@ -41,7 +41,7 @@ class IslandDatasetBuilder:
         self.evaluator = StructureEvaluator(map_size=map_size)
         self.scorer = scorer or MapScorer()
         self.sampling_profile = sampling_profile
-        self.param_ranges = self.generator.get_param_ranges(map_size)
+        self.param_ranges = self.generator.get_param_ranges(map_size, profile=sampling_profile)
         self.param_normalizer = ParameterSpaceNormalizer(self.param_ranges)
 
     def generate_samples(
