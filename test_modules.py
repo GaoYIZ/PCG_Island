@@ -21,7 +21,16 @@ from pcg_generator import PCGIslandGenerator
 from ppo_baseline import PPOAgent
 from rl_environment import IslandGenerationEnv
 from structure_evaluator import StructureEvaluator
-from formal_experiment import apply_fast_profile, apply_formal_rl_preset, apply_formal_vae_preset, apply_optuna_best_trial, split_indices, subset_arrays
+from formal_experiment import (
+    apply_fast_profile,
+    apply_formal_rl_preset,
+    apply_formal_vae_preset,
+    apply_optuna_best_trial,
+    get_selected_supervision_metric_names,
+    split_indices,
+    subset_arrays,
+)
+from optuna_vae_tuning import STRUCTURE_METRIC_NAMES, get_selected_metric_names
 from vae_model import BetaVAE, HeightmapDataset, encode_heightmaps, train_vae
 
 
@@ -115,6 +124,21 @@ class IslandPipelineTests(unittest.TestCase):
             len(builder.evaluator.supervision_metric_names),
         )
         self.assertIn("component_count", builder.evaluator.supervision_metric_names)
+
+    def test_supervision_selection_can_drop_connectivity(self) -> None:
+        class Args:
+            drop_connectivity_supervision = True
+
+        selected_names = get_selected_supervision_metric_names(Args(), self.evaluator.supervision_metric_names)
+        self.assertNotIn("connectivity", selected_names)
+        self.assertIn("path_reachability", selected_names)
+
+    def test_optuna_metric_name_selection_can_drop_connectivity(self) -> None:
+        class Args:
+            drop_connectivity_supervision = True
+
+        selected_names = get_selected_metric_names(Args())
+        self.assertEqual(selected_names, STRUCTURE_METRIC_NAMES[1:])
 
     def test_feature_normalization_keeps_values_on_shared_scale(self) -> None:
         metrics_list = [
@@ -357,6 +381,7 @@ class IslandPipelineTests(unittest.TestCase):
             vae_land_recon_focus_weight = 2.0
             vae_coast_recon_focus_weight = 3.2
             vae_lr = 8e-4
+            drop_connectivity_supervision = False
 
         payload = {
             "best_params": {
@@ -377,7 +402,8 @@ class IslandPipelineTests(unittest.TestCase):
                 "land_recon_focus_weight": 2.7,
                 "coast_recon_focus_weight": 3.9,
                 "learning_rate": 5e-4,
-            }
+            },
+            "drop_connectivity_supervision": True,
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -405,6 +431,7 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(args.vae_land_recon_focus_weight, 2.7)
         self.assertAlmostEqual(args.vae_coast_recon_focus_weight, 3.9)
         self.assertAlmostEqual(args.vae_lr, 5e-4)
+        self.assertTrue(args.drop_connectivity_supervision)
 
     def test_fast_profile_downshifts_64x64_formal_rl(self) -> None:
         class Args:

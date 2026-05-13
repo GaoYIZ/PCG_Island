@@ -53,6 +53,15 @@ def get_structure_supervision_weights(
     return [float(weight_map.get(name, 1.0)) for name in metric_names]
 
 
+def get_selected_metric_names(args: argparse.Namespace) -> tuple[str, ...]:
+    metric_names = STRUCTURE_METRIC_NAMES
+    if args.drop_connectivity_supervision:
+        metric_names = tuple(name for name in metric_names if name != "connectivity")
+    if not metric_names:
+        raise ValueError("At least one supervision metric must remain enabled for Optuna tuning.")
+    return metric_names
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optuna 调优 IslandTest 的 VAE")
     parser.add_argument("--output-dir", type=str, default="optuna_vae_outputs", help="调参输出目录")
@@ -62,6 +71,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-clean-samples", type=int, default=64, help="最少保留样本数")
     parser.add_argument("--max-dataset-samples", type=int, default=480, help="最大原始样本数")
     parser.add_argument("--sampling-profile", type=str, default="island", choices=["uniform", "island"])
+    parser.add_argument(
+        "--drop-connectivity-supervision",
+        action="store_true",
+        help="Remove connectivity from VAE structure supervision while leaving data generation unchanged.",
+    )
     parser.add_argument("--batch-size", type=int, default=32, help="训练批大小")
     parser.add_argument("--epochs", type=int, default=12, help="每个 trial 的训练轮数")
     parser.add_argument("--trials", type=int, default=12, help="Optuna trial 数")
@@ -94,7 +108,14 @@ def build_arrays(args: argparse.Namespace) -> dict[str, np.ndarray]:
         clean_samples = builder.clean_samples(raw_samples)
         round_index += 1
 
-    return builder.build_training_arrays(clean_samples)
+    arrays = builder.build_training_arrays(clean_samples)
+    selected_metric_names = get_selected_metric_names(args)
+    if selected_metric_names != STRUCTURE_METRIC_NAMES:
+        selected_indices = [STRUCTURE_METRIC_NAMES.index(name) for name in selected_metric_names]
+        selected_arrays = dict(arrays)
+        selected_arrays["supervision_metric_matrix"] = arrays["supervision_metric_matrix"][:, selected_indices]
+        return selected_arrays
+    return arrays
 
 
 def reconstruct(
@@ -165,8 +186,8 @@ def compute_latent_predictive_r2(
     train_metrics: np.ndarray,
     val_latents: np.ndarray,
     val_metrics: np.ndarray,
+    metric_names: tuple[str, ...],
 ) -> tuple[dict[str, float], float]:
-    metric_names = STRUCTURE_METRIC_NAMES
     scores: dict[str, float] = {}
     if len(train_latents) < 6 or len(val_latents) < 3:
         return {name: 0.0 for name in metric_names}, 0.0
@@ -189,6 +210,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    selected_metric_names = get_selected_metric_names(args)
     arrays = build_arrays(args)
     train_heightmaps, val_heightmaps, train_metrics, val_metrics = train_test_split(
         arrays["heightmaps"],
@@ -209,7 +231,10 @@ def main() -> None:
         coast_dice_loss_weight = trial.suggest_float("coast_dice_loss_weight", 0.15, 0.50)
         structure_loss_weight = trial.suggest_float("structure_loss_weight", 0.10, 1.20)
         metric_alignment_loss_weight = trial.suggest_float("metric_alignment_loss_weight", 0.05, 1.20)
-        connectivity_supervision_weight = trial.suggest_float("connectivity_supervision_weight", 1.2, 4.0)
+        if args.drop_connectivity_supervision:
+            connectivity_supervision_weight = STRUCTURE_WEIGHT_MAP["connectivity"]
+        else:
+            connectivity_supervision_weight = trial.suggest_float("connectivity_supervision_weight", 1.2, 4.0)
         path_reachability_supervision_weight = trial.suggest_float("path_reachability_supervision_weight", 1.5, 5.0)
         land_recon_focus_weight = trial.suggest_float("land_recon_focus_weight", 1.2, 3.5)
         coast_recon_focus_weight = trial.suggest_float("coast_recon_focus_weight", 2.0, 5.5)
@@ -233,6 +258,7 @@ def main() -> None:
             structure_loss_weight=structure_loss_weight,
             metric_alignment_loss_weight=metric_alignment_loss_weight,
             structure_loss_weights=get_structure_supervision_weights(
+                selected_metric_names,
                 connectivity_weight=connectivity_supervision_weight,
                 path_reachability_weight=path_reachability_supervision_weight,
             ),
@@ -270,10 +296,12 @@ def main() -> None:
             train_metrics=train_metrics,
             val_latents=latents,
             val_metrics=val_metrics,
+            metric_names=selected_metric_names,
         )
         clipped_r2 = np.clip(np.array(list(latent_predictive_r2.values()), dtype=np.float32), -1.5, 1.0)
         metric_weight_vector = np.array(
             get_structure_supervision_weights(
+                selected_metric_names,
                 connectivity_weight=connectivity_supervision_weight,
                 path_reachability_weight=path_reachability_supervision_weight,
             ),
@@ -314,6 +342,9 @@ def main() -> None:
         "best_value": float(study.best_value),
         "best_params": study.best_trial.params,
         "best_attrs": study.best_trial.user_attrs,
+        "sampling_profile": args.sampling_profile,
+        "drop_connectivity_supervision": bool(args.drop_connectivity_supervision),
+        "supervision_metric_names": list(selected_metric_names),
     }
     best["best_params"]["latent_dim"] = args.latent_dim
     (output_dir / "best_trial.json").write_text(json.dumps(best, ensure_ascii=False, indent=2), encoding="utf-8")

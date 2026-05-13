@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-clean-samples", type=int, default=48, help="Minimum clean samples kept after filtering")
     parser.add_argument("--max-dataset-samples", type=int, default=480, help="Maximum raw samples allowed during dataset building")
     parser.add_argument("--sampling-profile", type=str, default="island", choices=["uniform", "island"], help="Parameter sampling strategy")
+    parser.add_argument(
+        "--drop-connectivity-supervision",
+        action="store_true",
+        help="Remove connectivity from VAE structure supervision while leaving dataset generation unchanged.",
+    )
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for VAE/PPO")
     parser.add_argument("--latent-dim", type=int, default=128, help="VAE latent dimension")
     parser.add_argument("--vae-epochs", type=int, default=30, help="VAE training epochs")
@@ -174,6 +179,8 @@ def apply_optuna_best_trial(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Optuna best trial file not found: {trial_path}")
 
     trial_data = json.loads(trial_path.read_text(encoding="utf-8"))
+    if "drop_connectivity_supervision" in trial_data:
+        args.drop_connectivity_supervision = bool(trial_data["drop_connectivity_supervision"])
     best_params = trial_data.get("best_params", {})
     mapping = {
         "latent_dim": "latent_dim",
@@ -320,6 +327,29 @@ def get_structure_supervision_weights(
     if path_reachability_weight is not None:
         weight_map["path_reachability"] = float(path_reachability_weight)
     return [float(weight_map.get(name, 1.0)) for name in metric_names]
+
+
+def get_selected_supervision_metric_names(
+    args: argparse.Namespace,
+    metric_names: Sequence[str],
+) -> Tuple[str, ...]:
+    selected_metric_names = tuple(metric_names)
+    if args.drop_connectivity_supervision:
+        selected_metric_names = tuple(name for name in selected_metric_names if name != "connectivity")
+    if not selected_metric_names:
+        raise ValueError("At least one supervision metric must remain enabled for VAE training.")
+    return selected_metric_names
+
+
+def select_supervision_metrics(
+    arrays: Dict[str, np.ndarray],
+    available_metric_names: Sequence[str],
+    selected_metric_names: Sequence[str],
+) -> Dict[str, np.ndarray]:
+    selected_indices = [available_metric_names.index(name) for name in selected_metric_names]
+    selected_arrays = dict(arrays)
+    selected_arrays["supervision_metric_matrix"] = arrays["supervision_metric_matrix"][:, selected_indices]
+    return selected_arrays
 
 
 def draw_heightmap_with_coast(
@@ -671,6 +701,7 @@ def train_formal_vae(
             "latent_mean": float(latents.mean()),
             "latent_std": float(latents.std()),
             "vae_config": {
+                "supervision_metric_names": list(structure_metric_names),
                 "beta": args.vae_beta,
                 "beta_start": args.vae_beta_start,
                 "warmup_epochs": args.vae_warmup_epochs,
@@ -710,6 +741,7 @@ def evaluate_vae_representation(
     args: argparse.Namespace,
     builder: IslandDatasetBuilder,
     arrays: Dict[str, np.ndarray],
+    structure_metric_names: Sequence[str],
     vae: BetaVAE,
     latents: np.ndarray,
     output_dir: Path,
@@ -730,11 +762,11 @@ def evaluate_vae_representation(
         output_dir / "vae_reconstruction.png",
     )
     original_metrics = arrays["supervision_metric_matrix"]
-    structure_metric_names = tuple(builder.evaluator.supervision_metric_names)
+    structure_metric_names = tuple(structure_metric_names)
     land_mask, coast_band = build_focus_masks(arrays["heightmaps"])
     reconstructed_metrics = np.array(
         [
-            [builder.evaluator.evaluate(heightmap)[name] for name in builder.evaluator.supervision_metric_names]
+            [builder.evaluator.evaluate(heightmap)[name] for name in structure_metric_names]
             for heightmap in reconstructions
         ],
         dtype=np.float32,
@@ -869,6 +901,7 @@ def save_trained_vae_artifacts(
             "map_size": args.map_size,
             "latent_dim": args.latent_dim,
             "vae_config": {
+                "supervision_metric_names": list(metric_names),
                 "beta": args.vae_beta,
                 "beta_start": args.vae_beta_start,
                 "free_bits": args.vae_free_bits,
@@ -910,6 +943,10 @@ def run_formal_vae_pipeline(
     device: torch.device,
 ) -> Dict[str, object]:
     print_section("Formal VAE-only evaluation")
+    selected_metric_names = get_selected_supervision_metric_names(
+        args,
+        builder.evaluator.supervision_metric_names,
+    )
 
     train_idx, val_idx, test_idx = split_indices(
         num_samples=len(arrays["heightmaps"]),
@@ -922,7 +959,14 @@ def run_formal_vae_pipeline(
         "val": val_idx,
         "test": test_idx,
     }
-    split_arrays_map = {name: subset_arrays(arrays, idx) for name, idx in split_indices_map.items()}
+    split_arrays_map = {
+        name: select_supervision_metrics(
+            subset_arrays(arrays, idx),
+            builder.evaluator.supervision_metric_names,
+            selected_metric_names,
+        )
+        for name, idx in split_indices_map.items()
+    }
     split_clean_samples = {name: [clean_samples[int(i)] for i in idx] for name, idx in split_indices_map.items()}
 
     print(f"train/val/test sizes   : {len(train_idx)} / {len(val_idx)} / {len(test_idx)}")
@@ -932,7 +976,7 @@ def run_formal_vae_pipeline(
     vae, train_latents, history = train_formal_vae(
         args,
         split_arrays_map["train"],
-        builder.evaluator.supervision_metric_names,
+        selected_metric_names,
         train_dir,
         device,
     )
@@ -940,7 +984,7 @@ def run_formal_vae_pipeline(
         split_clean_samples["train"],
         latent_matrix=train_latents,
     )
-    save_trained_vae_artifacts(args, vae, feature_normalizer, builder.evaluator.supervision_metric_names, output_dir)
+    save_trained_vae_artifacts(args, vae, feature_normalizer, selected_metric_names, output_dir)
 
     split_summaries: Dict[str, Dict[str, object]] = {}
     split_latents: Dict[str, np.ndarray] = {"train": train_latents}
@@ -960,6 +1004,7 @@ def run_formal_vae_pipeline(
             args,
             builder,
             split_arrays_map[split_name],
+            selected_metric_names,
             vae,
             split_latents[split_name],
             split_dir,
@@ -991,6 +1036,8 @@ def run_formal_vae_pipeline(
         "vae_epochs": args.vae_epochs,
         "batch_size": args.batch_size,
         "sampling_profile": args.sampling_profile,
+        "drop_connectivity_supervision": bool(args.drop_connectivity_supervision),
+        "supervision_metric_names": list(selected_metric_names),
         "clean_dataset_size": int(len(clean_samples)),
         "split_sizes": {
             "train": int(len(train_idx)),
@@ -1016,9 +1063,9 @@ def run_formal_vae_pipeline(
             "structure_supervision_weights": {
                 name: weight
                 for name, weight in zip(
-                    builder.evaluator.metric_names,
+                    selected_metric_names,
                     get_structure_supervision_weights(
-                        builder.evaluator.metric_names,
+                        selected_metric_names,
                         connectivity_weight=args.vae_connectivity_supervision_weight,
                         path_reachability_weight=args.vae_path_reachability_supervision_weight,
                     ),
@@ -1459,7 +1506,16 @@ def main() -> None:
         print(f"RL ????????      : {final_summary['state_definition']['state_dim']}")
         return
 
-    vae, latents, _ = train_formal_vae(args, arrays, builder.evaluator.supervision_metric_names, output_dir, device)
+    selected_metric_names = get_selected_supervision_metric_names(
+        args,
+        builder.evaluator.supervision_metric_names,
+    )
+    selected_arrays = select_supervision_metrics(
+        arrays,
+        builder.evaluator.supervision_metric_names,
+        selected_metric_names,
+    )
+    vae, latents, _ = train_formal_vae(args, selected_arrays, selected_metric_names, output_dir, device)
 
     print_section("第三阶段：特征归一化拟合")
     metric_names = builder.evaluator.metric_names
@@ -1470,7 +1526,16 @@ def main() -> None:
     print(f"结构指标维度        : {len(metric_names)}")
     print(f"latent 维度         : {latents.shape[1]}")
 
-    vae_summary = evaluate_vae_representation(args, builder, arrays, vae, latents, output_dir, device)
+    vae_summary = evaluate_vae_representation(
+        args,
+        builder,
+        selected_arrays,
+        selected_metric_names,
+        vae,
+        latents,
+        output_dir,
+        device,
+    )
 
     if args.skip_rl:
         final_summary: Dict[str, object] = {
