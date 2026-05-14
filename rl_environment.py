@@ -33,15 +33,13 @@ class IslandGenerationEnv(gym.Env):
         sampling_profile: str = "island",
         novelty_reference_vectors: Optional[Sequence[Sequence[float]]] = None,
         expert_param_vectors: Optional[Sequence[Sequence[float]]] = None,
-        reward_delta_scale: float = 2.0,
-        reward_best_scale: float = 0.5,
-        reward_expert_scale: float = 0.0,
-        reward_step_penalty: float = 0.005,
-        reward_success_bonus: float = 0.80,
-        reward_failure_penalty: float = 0.80,
-        reward_stagnation_penalty: float = 0.10,
-        success_score_threshold: float = 0.70,
-        failure_score_threshold: float = 0.12,
+        # 简化的奖励参数配置（只保留三个核心组件）
+        reward_current_scale: float = 1.0,    # 当前质量的奖励权重
+        reward_delta_scale: float = 2.0,      # 分数变化的奖励权重
+        reward_step_penalty: float = 0.002,   # 每步微小惩罚
+        reward_success_bonus: float = 1.0,    # 成功终止奖励
+        success_score_threshold: float = 0.60,
+        failure_score_threshold: float = 0.15,
         success_streak_required: int = 2,
         stagnation_patience: int = 6,
         stagnation_delta: float = 1e-3,
@@ -63,13 +61,10 @@ class IslandGenerationEnv(gym.Env):
         self.expert_param_vectors = None if expert_param_vectors is None else np.asarray(
             expert_param_vectors, dtype=np.float32
         )
+        self.reward_current_scale = float(reward_current_scale)
         self.reward_delta_scale = float(reward_delta_scale)
-        self.reward_best_scale = float(reward_best_scale)
-        self.reward_expert_scale = float(reward_expert_scale)
         self.reward_step_penalty = float(reward_step_penalty)
         self.reward_success_bonus = float(reward_success_bonus)
-        self.reward_failure_penalty = float(reward_failure_penalty)
-        self.reward_stagnation_penalty = float(reward_stagnation_penalty)
         self.success_score_threshold = float(success_score_threshold)
         self.failure_score_threshold = float(failure_score_threshold)
         self.success_streak_required = int(max(1, success_streak_required))
@@ -185,21 +180,15 @@ class IslandGenerationEnv(gym.Env):
         score = self._score_current_state()
         previous_total_score = float(self.previous_score.total_score) if self.previous_score is not None else 0.0
         delta_score = float(score.total_score - previous_total_score)
-        previous_best_total_score = float(self.best_total_score)
-        best_delta = max(0.0, float(score.total_score) - previous_best_total_score)
-        current_expert_distance = self._get_expert_distance() if self.reward_expert_scale != 0.0 else None
-        expert_delta = 0.0
-        if current_expert_distance is not None and self.previous_expert_distance is not None:
-            expert_delta = float(self.previous_expert_distance - current_expert_distance)
-
+        
+        # 简化的奖励计算（只保留三个核心组件）
+        current_term = self.reward_current_scale * float(score.total_score)
         delta_term = self.reward_delta_scale * delta_score
-        best_term = self.reward_best_scale * best_delta
-        expert_term = self.reward_expert_scale * expert_delta
         step_penalty_term = -self.reward_step_penalty
-        reward = delta_term + best_term + expert_term + step_penalty_term
+        
+        # 核心奖励：当前质量 + 进步 + 步数惩罚
+        reward = current_term + delta_term + step_penalty_term
         success_bonus = 0.0
-        failure_penalty = 0.0
-        stagnation_penalty = 0.0
         done_reason = "in_progress"
 
         if float(score.total_score) > self.best_total_score + self.stagnation_delta:
@@ -221,13 +210,9 @@ class IslandGenerationEnv(gym.Env):
             terminated = True
             done_reason = "success_threshold"
         elif float(score.total_score) <= self.failure_score_threshold:
-            failure_penalty = self.reward_failure_penalty
-            reward -= failure_penalty
             truncated = True
             done_reason = "failure_threshold"
         elif self.stagnation_steps >= self.stagnation_patience:
-            stagnation_penalty = self.reward_stagnation_penalty
-            reward -= stagnation_penalty
             truncated = True
             done_reason = "stagnation"
         elif self.steps >= self.max_steps:
@@ -246,16 +231,12 @@ class IslandGenerationEnv(gym.Env):
             "done_reason": done_reason,
             "reward_components": {
                 "reward": float(reward),
+                "current_score": float(score.total_score),
                 "delta_score": delta_score,
-                "best_delta": float(best_delta),
-                "expert_delta": expert_delta,
+                "current_term": float(current_term),
                 "delta_term": float(delta_term),
-                "best_term": float(best_term),
-                "expert_term": float(expert_term),
                 "step_penalty_term": float(step_penalty_term),
                 "success_bonus": success_bonus,
-                "failure_penalty": failure_penalty,
-                "stagnation_penalty": stagnation_penalty,
                 "previous_total_score": previous_total_score,
                 "current_total_score": float(score.total_score),
                 "best_total_score": float(self.best_total_score),
