@@ -107,6 +107,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="Maximum steps per PPO episode")
     parser.add_argument("--ppo-hidden-dim", type=int, default=256, help="PPO hidden dimension")
     parser.add_argument("--sac-episodes", type=int, default=0, help="Extra SAC training episodes; 0 disables SAC")
+    parser.add_argument("--rl-reset-profile", type=str, default="uniform", choices=["uniform", "island"], help="Sampling profile used for RL environment resets")
+    parser.add_argument("--sac-actor-lr", type=float, default=3e-4, help="Actor learning rate for SAC")
+    parser.add_argument("--sac-critic-lr", type=float, default=1e-3, help="Critic learning rate for SAC")
+    parser.add_argument("--sac-alpha-lr", type=float, default=3e-4, help="Entropy-temperature learning rate for SAC")
+    parser.add_argument("--sac-learning-starts", type=int, default=512, help="Number of environment steps collected before SAC updates start")
+    parser.add_argument("--sac-print-interval", type=int, default=5, help="Episode interval for SAC progress printing")
+    parser.add_argument("--expert-top-percent", type=float, default=0.10, help="Top fraction of cleaned samples saved as expert references")
+    parser.add_argument("--expert-max-samples", type=int, default=256, help="Maximum number of expert samples exported and used for expert guidance")
+    parser.add_argument("--novelty-reference-size", type=int, default=256, help="Maximum number of cleaned samples used as the fixed novelty reference bank")
+    parser.add_argument("--reward-delta-scale", type=float, default=12.0, help="Multiplier applied to total-score improvement between consecutive states")
+    parser.add_argument("--reward-expert-scale", type=float, default=1.5, help="Multiplier applied to movement toward expert parameter vectors")
+    parser.add_argument("--reward-step-penalty", type=float, default=0.01, help="Small per-step penalty to encourage faster convergence")
+    parser.add_argument("--reward-success-bonus", type=float, default=1.0, help="Bonus added when the success threshold is reached")
+    parser.add_argument("--reward-failure-penalty", type=float, default=0.75, help="Penalty added when the failure threshold is crossed")
+    parser.add_argument("--reward-success-threshold", type=float, default=0.78, help="Episode ends successfully once the total score reaches this threshold enough times")
+    parser.add_argument("--reward-failure-threshold", type=float, default=0.18, help="Episode fails early if the total score falls below this threshold")
+    parser.add_argument("--reward-success-streak", type=int, default=2, help="Number of consecutive successful steps required for early success termination")
+    parser.add_argument("--reward-stagnation-patience", type=int, default=6, help="Early-stop an episode after this many non-improving steps")
+    parser.add_argument("--reward-stagnation-delta", type=float, default=1e-3, help="Minimum score improvement counted as progress")
     parser.add_argument("--eval-islands", type=int, default=12, help="Number of final evaluation islands")
     parser.add_argument("--skip-rl", action="store_true", help="Stop after VAE evaluation and skip RL/baselines")
     parser.add_argument(
@@ -694,6 +713,76 @@ def build_dataset(
     return builder, clean_samples, arrays, clean_summary
 
 
+def build_rl_reference_bank(
+    args: argparse.Namespace,
+    clean_samples: Sequence,
+    feature_normalizer: IslandFeatureNormalizer,
+    output_dir: Path,
+) -> Dict[str, np.ndarray]:
+    valid_samples = [sample for sample in clean_samples if sample.valid]
+    if not valid_samples:
+        raise ValueError("No valid cleaned samples are available for RL reference-bank construction.")
+
+    novelty_candidates = sorted(valid_samples, key=lambda sample: sample.score)
+    novelty_count = min(max(1, args.novelty_reference_size), len(novelty_candidates))
+    novelty_indices = np.unique(np.linspace(0, len(novelty_candidates) - 1, novelty_count, dtype=int))
+    novelty_samples = [novelty_candidates[int(idx)] for idx in novelty_indices]
+    novelty_reference_vectors = np.stack(
+        [feature_normalizer.transform_metrics(sample.metrics) for sample in novelty_samples],
+        axis=0,
+    ).astype(np.float32)
+
+    ranked_samples = sorted(valid_samples, key=lambda sample: sample.score, reverse=True)
+    expert_count = min(
+        max(1, int(np.ceil(len(ranked_samples) * args.expert_top_percent))),
+        max(1, args.expert_max_samples),
+        len(ranked_samples),
+    )
+    expert_samples = ranked_samples[:expert_count]
+    expert_param_vectors = np.stack([sample.normalized_params for sample in expert_samples], axis=0).astype(np.float32)
+    expert_scores = np.asarray([sample.score for sample in expert_samples], dtype=np.float32)
+    expert_metric_matrix = np.asarray(
+        [[float(value) for value in sample.metrics.values()] for sample in expert_samples],
+        dtype=np.float32,
+    )
+    expert_heightmaps = np.stack([sample.heightmap for sample in expert_samples], axis=0).astype(np.float32)
+
+    np.savez_compressed(
+        output_dir / "expert_bank.npz",
+        normalized_params=expert_param_vectors,
+        quality_scores=expert_scores,
+        metric_matrix=expert_metric_matrix,
+        heightmaps=expert_heightmaps,
+        novelty_reference_vectors=novelty_reference_vectors,
+    )
+    save_json(
+        {
+            "expert_count": int(expert_count),
+            "expert_top_percent": float(args.expert_top_percent),
+            "novelty_reference_count": int(len(novelty_reference_vectors)),
+            "experts": [
+                {
+                    "rank": index + 1,
+                    "score": float(sample.score),
+                    "params": {
+                        key: float(value) if isinstance(value, (int, float, np.floating, np.integer)) else value
+                        for key, value in sample.params.items()
+                    },
+                    "metrics": {key: float(value) for key, value in sample.metrics.items()},
+                    "normalized_params": [float(value) for value in sample.normalized_params],
+                }
+                for index, sample in enumerate(expert_samples)
+            ],
+        },
+        output_dir / "expert_bank_summary.json",
+    )
+    return {
+        "novelty_reference_vectors": novelty_reference_vectors,
+        "expert_param_vectors": expert_param_vectors,
+        "expert_scores": expert_scores,
+    }
+
+
 def train_formal_vae(
     args: argparse.Namespace,
     arrays: Dict[str, np.ndarray],
@@ -1181,6 +1270,7 @@ def build_env_factory(
     args: argparse.Namespace,
     vae: BetaVAE,
     feature_normalizer: IslandFeatureNormalizer,
+    reference_bank: Dict[str, np.ndarray],
 ) -> Callable[[], IslandGenerationEnv]:
     def factory() -> IslandGenerationEnv:
         return IslandGenerationEnv(
@@ -1189,7 +1279,19 @@ def build_env_factory(
             vae_model=vae,
             feature_normalizer=feature_normalizer,
             include_latent=True,
-            sampling_profile=args.sampling_profile,
+            sampling_profile=args.rl_reset_profile,
+            novelty_reference_vectors=reference_bank["novelty_reference_vectors"],
+            expert_param_vectors=reference_bank["expert_param_vectors"],
+            reward_delta_scale=args.reward_delta_scale,
+            reward_expert_scale=args.reward_expert_scale,
+            reward_step_penalty=args.reward_step_penalty,
+            reward_success_bonus=args.reward_success_bonus,
+            reward_failure_penalty=args.reward_failure_penalty,
+            success_score_threshold=args.reward_success_threshold,
+            failure_score_threshold=args.reward_failure_threshold,
+            success_streak_required=args.reward_success_streak,
+            stagnation_patience=args.reward_stagnation_patience,
+            stagnation_delta=args.reward_stagnation_delta,
         )
 
     return factory
@@ -1214,8 +1316,9 @@ def run_formal_rl_experiment(
     vae = pipeline["vae"]
     feature_normalizer = pipeline["feature_normalizer"]
     vae_summary = pipeline["final_summary"]
+    reference_bank = build_rl_reference_bank(args, clean_samples, feature_normalizer, output_dir)
 
-    env_factory = build_env_factory(args, vae, feature_normalizer)
+    env_factory = build_env_factory(args, vae, feature_normalizer, reference_bank)
     zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
     random_policy = RandomPolicy(action_dim=len(builder.param_normalizer.param_names), seed=args.seed + 3000)
     zero_summary = evaluate_agent("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
@@ -1226,7 +1329,7 @@ def run_formal_rl_experiment(
 
     sac_summary = None
     if args.sac_episodes > 0:
-        sac_agent, _ = train_sac(args, env_factory, output_dir, device)
+        sac_agent, _ = train_sac_with_logging(args, env_factory, output_dir, device)
         sac_summary = evaluate_agent("SAC", sac_agent, env_factory, output_dir, args.eval_islands, args.seed + 4000)
 
     policy_summaries = {
@@ -1249,6 +1352,11 @@ def run_formal_rl_experiment(
             "action": "delta_theta_norm",
         },
         "reward_definition": builder.scorer.describe(),
+        "rl_reference_bank": {
+            "rl_reset_profile": args.rl_reset_profile,
+            "expert_count": int(len(reference_bank["expert_param_vectors"])),
+            "novelty_reference_count": int(len(reference_bank["novelty_reference_vectors"])),
+        },
         "policy_comparison": compare_policy_summaries(policy_summaries),
         "zero_summary": zero_summary,
         "random_summary": random_summary,
@@ -1340,7 +1448,7 @@ def train_ppo(
     return agent, episode_rewards, episode_logs
 
 
-def train_sac(
+def train_sac_with_logging(
     args: argparse.Namespace,
     env_factory: Callable[[], IslandGenerationEnv],
     output_dir: Path,
@@ -1360,31 +1468,76 @@ def train_sac(
         state_dim=env.observation_space.shape[0],
         action_dim=env.action_space.shape[0],
         action_range=1.0,
+        actor_learning_rate=args.sac_actor_lr,
+        critic_learning_rate=args.sac_critic_lr,
+        alpha_learning_rate=args.sac_alpha_lr,
     ).to(device)
     replay_buffer = ReplayBuffer(capacity=10000)
 
     episode_rewards: List[float] = []
+    episode_logs: List[dict] = []
+    total_env_steps = 0
     for episode in range(args.sac_episodes):
         state, _ = env.reset(seed=args.seed + 1000 + episode)
         episode_reward = 0.0
+        last_info: Optional[dict] = None
+        last_losses: Dict[str, float] = {}
 
         for _ in range(env.max_steps):
-            action = agent.select_action(state)
-            next_state, reward, terminated, truncated, _ = env.step(action)
+            if total_env_steps < args.sac_learning_starts:
+                action = env.action_space.sample()
+            else:
+                action = agent.select_action(state)
+            next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
             replay_buffer.push(state, action, reward, next_state, done)
-            if len(replay_buffer) >= max(256, args.batch_size * 4):
-                agent.update(replay_buffer, batch_size=args.batch_size)
+            total_env_steps += 1
+            if total_env_steps >= args.sac_learning_starts and len(replay_buffer) >= max(256, args.batch_size * 4):
+                losses = agent.update(replay_buffer, batch_size=args.batch_size)
+                if losses is not None:
+                    last_losses = {key: float(value) for key, value in losses.items()}
 
             episode_reward += reward
             state = next_state
+            last_info = info
             if done:
                 break
 
         episode_rewards.append(float(episode_reward))
+        episode_logs.append(
+            {
+                "episode": episode + 1,
+                "reward": float(episode_reward),
+                "total_env_steps": int(total_env_steps),
+                "score": {} if last_info is None else last_info["score"],
+                "reward_components": {} if last_info is None else last_info["reward_components"],
+                "done_reason": None if last_info is None else last_info.get("done_reason"),
+                "losses": last_losses,
+            }
+        )
         live_plotter.update(episode_rewards)
-        if (episode + 1) % 10 == 0 or episode == 0:
+        if (episode + 1) % args.sac_print_interval == 0 or episode == 0:
+            reward_components = {} if last_info is None else last_info.get("reward_components", {})
+            score = {} if last_info is None else last_info.get("score", {})
+            print(
+                f"Episode {episode + 1:>3} / {args.sac_episodes} | "
+                f"reward {episode_reward:.4f} | "
+                f"recent_avg {np.mean(episode_rewards[-args.sac_print_interval:]):.4f} | "
+                f"score {score.get('total_score', float('nan')):.4f} | "
+                f"delta {reward_components.get('delta_score', float('nan')):.4f} | "
+                f"novelty {score.get('novelty_score', float('nan')):.4f} | "
+                f"expert_delta {reward_components.get('expert_delta', float('nan')):.4f} | "
+                f"done {None if last_info is None else last_info.get('done_reason')}"
+            )
+            if last_losses:
+                print(
+                    f"    losses: q={last_losses.get('q_loss', float('nan')):.4f}, "
+                    f"policy={last_losses.get('policy_loss', float('nan')):.4f}, "
+                    f"alpha={last_losses.get('alpha_loss', float('nan')):.4f}, "
+                    f"alpha_val={last_losses.get('alpha', float('nan')):.4f}"
+                )
+            continue
             print(
                 f"第 {episode + 1:>3} 轮 / {args.sac_episodes} 轮 | "
                 f"累计奖励 {episode_reward:.4f} | "
@@ -1394,7 +1547,15 @@ def train_sac(
     live_plotter.close(episode_rewards)
     agent.save(output_dir / "sac_agent.pth")
     save_json(
-        {"reward_summary": summarize_rewards(episode_rewards)},
+        {
+            "reward_summary": summarize_rewards(episode_rewards),
+            "episodes": episode_logs,
+            "total_env_steps": int(total_env_steps),
+            "learning_starts": int(args.sac_learning_starts),
+            "actor_lr": float(args.sac_actor_lr),
+            "critic_lr": float(args.sac_critic_lr),
+            "alpha_lr": float(args.sac_alpha_lr),
+        },
         output_dir / "sac_training_summary.json",
     )
     return agent, episode_rewards
@@ -1633,7 +1794,8 @@ def main() -> None:
         print("- final_summary.json")
         return
 
-    env_factory = build_env_factory(args, vae, feature_normalizer)
+    reference_bank = build_rl_reference_bank(args, clean_samples, feature_normalizer, output_dir)
+    env_factory = build_env_factory(args, vae, feature_normalizer, reference_bank)
     zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
     random_policy = RandomPolicy(action_dim=len(builder.param_normalizer.param_names), seed=args.seed + 3000)
     zero_summary = evaluate_agent("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
@@ -1659,7 +1821,7 @@ def main() -> None:
     }
 
     if args.sac_episodes > 0:
-        sac_agent, _ = train_sac(args, env_factory, output_dir, device)
+        sac_agent, _ = train_sac_with_logging(args, env_factory, output_dir, device)
         sac_summary = evaluate_agent("SAC", sac_agent, env_factory, output_dir, args.eval_islands, args.seed + 4000)
         final_summary["SAC 评估总结"] = sac_summary
 

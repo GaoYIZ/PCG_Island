@@ -31,6 +31,18 @@ class IslandGenerationEnv(gym.Env):
         include_latent: bool = True,
         action_step_scale: float = 0.15,
         sampling_profile: str = "island",
+        novelty_reference_vectors: Optional[Sequence[Sequence[float]]] = None,
+        expert_param_vectors: Optional[Sequence[Sequence[float]]] = None,
+        reward_delta_scale: float = 12.0,
+        reward_expert_scale: float = 1.5,
+        reward_step_penalty: float = 0.01,
+        reward_success_bonus: float = 1.0,
+        reward_failure_penalty: float = 0.75,
+        success_score_threshold: float = 0.78,
+        failure_score_threshold: float = 0.18,
+        success_streak_required: int = 2,
+        stagnation_patience: int = 6,
+        stagnation_delta: float = 1e-3,
     ):
         super().__init__()
 
@@ -43,6 +55,22 @@ class IslandGenerationEnv(gym.Env):
         self.evaluator = StructureEvaluator(map_size=map_size)
         self.scorer = scorer or MapScorer()
         self.sampling_profile = sampling_profile
+        self.novelty_reference_vectors = None if novelty_reference_vectors is None else [
+            np.asarray(vector, dtype=np.float32) for vector in novelty_reference_vectors
+        ]
+        self.expert_param_vectors = None if expert_param_vectors is None else np.asarray(
+            expert_param_vectors, dtype=np.float32
+        )
+        self.reward_delta_scale = float(reward_delta_scale)
+        self.reward_expert_scale = float(reward_expert_scale)
+        self.reward_step_penalty = float(reward_step_penalty)
+        self.reward_success_bonus = float(reward_success_bonus)
+        self.reward_failure_penalty = float(reward_failure_penalty)
+        self.success_score_threshold = float(success_score_threshold)
+        self.failure_score_threshold = float(failure_score_threshold)
+        self.success_streak_required = int(max(1, success_streak_required))
+        self.stagnation_patience = int(max(1, stagnation_patience))
+        self.stagnation_delta = float(max(0.0, stagnation_delta))
 
         self.param_ranges = self.generator.get_param_ranges(map_size, profile=sampling_profile)
         self.param_normalizer = ParameterSpaceNormalizer(
@@ -77,8 +105,11 @@ class IslandGenerationEnv(gym.Env):
         self.current_latent: np.ndarray | None = None
         self.current_seed: int = 42
         self.steps = 0
-        self.history_buffer: list[np.ndarray] = []
-        self.buffer_size = 100
+        self.previous_score = None
+        self.previous_expert_distance: float | None = None
+        self.best_total_score = float("-inf")
+        self.success_streak = 0
+        self.stagnation_steps = 0
 
     def reset(
         self,
@@ -93,12 +124,31 @@ class IslandGenerationEnv(gym.Env):
         self.current_metrics = self.evaluator.evaluate(self.current_heightmap)
         self.current_latent = self._encode_latent(self.current_heightmap)
         self.steps = 0
+        self.previous_score = self._score_current_state()
+        self.previous_expert_distance = self._get_expert_distance()
+        self.best_total_score = float(self.previous_score.total_score)
+        self.success_streak = 0
+        self.stagnation_steps = 0
 
         state = self._get_state()
         info = {
             "metrics": dict(self.current_metrics),
             "params": dict(self.current_params),
-            "score": self.scorer.score_metrics(self.current_metrics).as_dict(),
+            "score": self.previous_score.as_dict(),
+            "reward_components": {
+                "reward": 0.0,
+                "delta_score": 0.0,
+                "expert_delta": 0.0,
+                "step_penalty": self.reward_step_penalty,
+                "success_bonus": 0.0,
+                "failure_penalty": 0.0,
+                "previous_total_score": float(self.previous_score.total_score),
+                "current_total_score": float(self.previous_score.total_score),
+                "best_total_score": float(self.best_total_score),
+                "expert_distance": self.previous_expert_distance,
+                "novelty_score": float(self.previous_score.novelty_score),
+                "done_reason": "reset",
+            },
         }
         return state, info
 
@@ -113,21 +163,51 @@ class IslandGenerationEnv(gym.Env):
         self.current_heightmap = self.generator.generate_heightmap(self.current_params)
         self.current_metrics = self.evaluator.evaluate(self.current_heightmap)
         self.current_latent = self._encode_latent(self.current_heightmap)
-        novelty_vector = self._get_novelty_vector()
+        score = self._score_current_state()
+        previous_total_score = float(self.previous_score.total_score) if self.previous_score is not None else 0.0
+        delta_score = float(score.total_score - previous_total_score)
+        current_expert_distance = self._get_expert_distance()
+        expert_delta = 0.0
+        if current_expert_distance is not None and self.previous_expert_distance is not None:
+            expert_delta = float(self.previous_expert_distance - current_expert_distance)
 
-        score = self.scorer.score_metrics(
-            self.current_metrics,
-            feature_vector=novelty_vector,
-            history_vectors=self.history_buffer,
-        )
+        reward = self.reward_delta_scale * delta_score + self.reward_expert_scale * expert_delta - self.reward_step_penalty
+        success_bonus = 0.0
+        failure_penalty = 0.0
+        done_reason = "in_progress"
 
-        if novelty_vector is not None:
-            if len(self.history_buffer) >= self.buffer_size:
-                self.history_buffer.pop(0)
-            self.history_buffer.append(novelty_vector.copy())
+        if float(score.total_score) > self.best_total_score + self.stagnation_delta:
+            self.best_total_score = float(score.total_score)
+            self.stagnation_steps = 0
+        else:
+            self.stagnation_steps += 1
 
-        terminated = self.steps >= self.max_steps
+        if float(score.total_score) >= self.success_score_threshold:
+            self.success_streak += 1
+        else:
+            self.success_streak = 0
+
+        terminated = False
         truncated = False
+        if self.success_streak >= self.success_streak_required:
+            success_bonus = self.reward_success_bonus
+            reward += success_bonus
+            terminated = True
+            done_reason = "success_threshold"
+        elif float(score.total_score) <= self.failure_score_threshold:
+            failure_penalty = self.reward_failure_penalty
+            reward -= failure_penalty
+            truncated = True
+            done_reason = "failure_threshold"
+        elif self.stagnation_steps >= self.stagnation_patience:
+            truncated = True
+            done_reason = "stagnation"
+        elif self.steps >= self.max_steps:
+            terminated = True
+            done_reason = "max_steps"
+
+        self.previous_score = score
+        self.previous_expert_distance = current_expert_distance
         state = self._get_state()
 
         info = {
@@ -135,8 +215,23 @@ class IslandGenerationEnv(gym.Env):
             "params": dict(self.current_params),
             "score": score.as_dict(),
             "heightmap": self.current_heightmap,
+            "done_reason": done_reason,
+            "reward_components": {
+                "reward": float(reward),
+                "delta_score": delta_score,
+                "expert_delta": expert_delta,
+                "step_penalty": self.reward_step_penalty,
+                "success_bonus": success_bonus,
+                "failure_penalty": failure_penalty,
+                "previous_total_score": previous_total_score,
+                "current_total_score": float(score.total_score),
+                "best_total_score": float(self.best_total_score),
+                "expert_distance": current_expert_distance,
+                "novelty_score": float(score.novelty_score),
+                "done_reason": done_reason,
+            },
         }
-        return state, float(score.total_score), terminated, truncated, info
+        return state, float(reward), terminated, truncated, info
 
     def render(self, mode: str = "human") -> None:
         if mode == "human" and self.current_metrics is not None:
@@ -161,9 +256,22 @@ class IslandGenerationEnv(gym.Env):
     def _get_novelty_vector(self) -> Optional[np.ndarray]:
         if self.current_metrics is None:
             return None
-        if self.include_latent and self.current_latent is not None:
-            return self.feature_normalizer.transform_latent(self.current_latent)
         return self.feature_normalizer.transform_metrics(self.current_metrics)
+
+    def _score_current_state(self):
+        novelty_vector = self._get_novelty_vector()
+        return self.scorer.score_metrics(
+            self.current_metrics,
+            feature_vector=novelty_vector,
+            history_vectors=self.novelty_reference_vectors,
+        )
+
+    def _get_expert_distance(self) -> Optional[float]:
+        if self.current_params is None or self.expert_param_vectors is None or len(self.expert_param_vectors) == 0:
+            return None
+        current_vector = self.param_normalizer.normalize_params(self.current_params)
+        distances = np.linalg.norm(self.expert_param_vectors - current_vector[None, :], axis=1)
+        return float(np.min(distances))
 
 
 if __name__ == "__main__":
