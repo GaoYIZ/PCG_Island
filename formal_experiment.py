@@ -28,7 +28,8 @@ from sklearn.model_selection import KFold, cross_val_score
 from torch.utils.data import DataLoader
 
 from dataset_pipeline import IslandDatasetBuilder
-from feature_processing import IslandFeatureNormalizer
+from feature_processing import IslandFeatureNormalizer, ParameterSpaceNormalizer
+from pcg_generator import PCGIslandGenerator
 from ppo_baseline import PPOAgent
 from reporting import (
     metric_label,
@@ -107,7 +108,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="Maximum steps per PPO episode")
     parser.add_argument("--ppo-hidden-dim", type=int, default=256, help="PPO hidden dimension")
     parser.add_argument("--sac-episodes", type=int, default=0, help="Extra SAC training episodes; 0 disables SAC")
-    parser.add_argument("--rl-reset-profile", type=str, default="uniform", choices=["uniform", "island"], help="Sampling profile used for RL environment resets")
+    parser.add_argument(
+        "--rl-reset-profile",
+        type=str,
+        default=None,
+        choices=["uniform", "island", "island_voronoi"],
+        help="Sampling profile used for RL environment resets; defaults to --sampling-profile when omitted",
+    )
     parser.add_argument("--sac-actor-lr", type=float, default=3e-4, help="Actor learning rate for SAC")
     parser.add_argument("--sac-critic-lr", type=float, default=1e-3, help="Critic learning rate for SAC")
     parser.add_argument("--sac-alpha-lr", type=float, default=3e-4, help="Entropy-temperature learning rate for SAC")
@@ -715,10 +722,21 @@ def build_dataset(
     return builder, clean_samples, arrays, clean_summary
 
 
+def resolve_rl_reset_profile(args: argparse.Namespace) -> str:
+    return args.rl_reset_profile or args.sampling_profile
+
+
+def build_rl_param_normalizer(args: argparse.Namespace) -> ParameterSpaceNormalizer:
+    profile = resolve_rl_reset_profile(args)
+    param_ranges = PCGIslandGenerator.get_param_ranges(args.map_size, profile=profile)
+    return ParameterSpaceNormalizer(param_ranges=param_ranges)
+
+
 def build_rl_reference_bank(
     args: argparse.Namespace,
     clean_samples: Sequence,
     feature_normalizer: IslandFeatureNormalizer,
+    param_normalizer,
     output_dir: Path,
 ) -> Dict[str, np.ndarray]:
     valid_samples = [sample for sample in clean_samples if sample.valid]
@@ -741,7 +759,10 @@ def build_rl_reference_bank(
         len(ranked_samples),
     )
     expert_samples = ranked_samples[:expert_count]
-    expert_param_vectors = np.stack([sample.normalized_params for sample in expert_samples], axis=0).astype(np.float32)
+    expert_param_vectors = np.stack(
+        [param_normalizer.normalize_params(sample.params) for sample in expert_samples],
+        axis=0,
+    ).astype(np.float32)
     expert_scores = np.asarray([sample.score for sample in expert_samples], dtype=np.float32)
     expert_metric_matrix = np.asarray(
         [[float(value) for value in sample.metrics.values()] for sample in expert_samples],
@@ -771,7 +792,10 @@ def build_rl_reference_bank(
                         for key, value in sample.params.items()
                     },
                     "metrics": {key: float(value) for key, value in sample.metrics.items()},
-                    "normalized_params": [float(value) for value in sample.normalized_params],
+                    "normalized_params": [
+                        float(value)
+                        for value in param_normalizer.normalize_params(sample.params)
+                    ],
                 }
                 for index, sample in enumerate(expert_samples)
             ],
@@ -1281,7 +1305,7 @@ def build_env_factory(
             vae_model=vae,
             feature_normalizer=feature_normalizer,
             include_latent=True,
-            sampling_profile=args.rl_reset_profile,
+            sampling_profile=resolve_rl_reset_profile(args),
             novelty_reference_vectors=reference_bank["novelty_reference_vectors"],
             expert_param_vectors=reference_bank["expert_param_vectors"],
             reward_delta_scale=args.reward_delta_scale,
@@ -1320,7 +1344,13 @@ def run_formal_rl_experiment(
     vae = pipeline["vae"]
     feature_normalizer = pipeline["feature_normalizer"]
     vae_summary = pipeline["final_summary"]
-    reference_bank = build_rl_reference_bank(args, clean_samples, feature_normalizer, output_dir)
+    reference_bank = build_rl_reference_bank(
+        args,
+        clean_samples,
+        feature_normalizer,
+        build_rl_param_normalizer(args),
+        output_dir,
+    )
 
     env_factory = build_env_factory(args, vae, feature_normalizer, reference_bank)
     zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
@@ -1357,7 +1387,7 @@ def run_formal_rl_experiment(
         },
         "reward_definition": builder.scorer.describe(),
         "rl_reference_bank": {
-            "rl_reset_profile": args.rl_reset_profile,
+            "rl_reset_profile": resolve_rl_reset_profile(args),
             "expert_count": int(len(reference_bank["expert_param_vectors"])),
             "novelty_reference_count": int(len(reference_bank["novelty_reference_vectors"])),
         },
@@ -1989,7 +2019,13 @@ def main() -> None:
         print("- final_summary.json")
         return
 
-    reference_bank = build_rl_reference_bank(args, clean_samples, feature_normalizer, output_dir)
+    reference_bank = build_rl_reference_bank(
+        args,
+        clean_samples,
+        feature_normalizer,
+        build_rl_param_normalizer(args),
+        output_dir,
+    )
     env_factory = build_env_factory(args, vae, feature_normalizer, reference_bank)
     zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
     random_policy = RandomPolicy(action_dim=len(builder.param_normalizer.param_names), seed=args.seed + 3000)

@@ -88,6 +88,16 @@ class IslandGenerationEnv(gym.Env):
         self.latent_dim = int(getattr(vae_model, "latent_dim", 0)) if self.include_latent else 0
         self.metric_dim = len(self.evaluator.metric_names)
         self.param_dim = len(self.param_normalizer.param_names)
+        if self.expert_param_vectors is not None and self.expert_param_vectors.size > 0:
+            if self.expert_param_vectors.ndim != 2:
+                raise ValueError(
+                    f"expert_param_vectors must be a 2D array, got shape {self.expert_param_vectors.shape}."
+                )
+            if self.expert_param_vectors.shape[1] != self.param_dim:
+                raise ValueError(
+                    "Expert parameter dimension does not match the current environment parameter dimension: "
+                    f"{self.expert_param_vectors.shape[1]} vs {self.param_dim}."
+                )
         self.state_dim = self.param_dim + self.metric_dim + self.latent_dim
 
         self.action_space = spaces.Box(
