@@ -1321,16 +1321,16 @@ def run_formal_rl_experiment(
     env_factory = build_env_factory(args, vae, feature_normalizer, reference_bank)
     zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
     random_policy = RandomPolicy(action_dim=len(builder.param_normalizer.param_names), seed=args.seed + 3000)
-    zero_summary = evaluate_agent("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
-    random_summary = evaluate_agent("Random", random_policy, env_factory, output_dir, args.eval_islands, args.seed + 1500)
+    zero_summary = evaluate_agent_with_gain("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
+    random_summary = evaluate_agent_with_gain("Random", random_policy, env_factory, output_dir, args.eval_islands, args.seed + 1500)
 
     ppo_agent, _, _ = train_ppo(args, env_factory, output_dir, device)
-    ppo_summary = evaluate_agent("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000)
+    ppo_summary = evaluate_agent_with_gain("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000)
 
     sac_summary = None
     if args.sac_episodes > 0:
         sac_agent, _ = train_sac_with_logging(args, env_factory, output_dir, device)
-        sac_summary = evaluate_agent("SAC", sac_agent, env_factory, output_dir, args.eval_islands, args.seed + 4000)
+        sac_summary = evaluate_agent_with_gain("SAC", sac_agent, env_factory, output_dir, args.eval_islands, args.seed + 4000)
 
     policy_summaries = {
         "Zero": zero_summary,
@@ -1357,7 +1357,7 @@ def run_formal_rl_experiment(
             "expert_count": int(len(reference_bank["expert_param_vectors"])),
             "novelty_reference_count": int(len(reference_bank["novelty_reference_vectors"])),
         },
-        "policy_comparison": compare_policy_summaries(policy_summaries),
+        "policy_comparison": compare_policy_summaries_with_gain(policy_summaries),
         "zero_summary": zero_summary,
         "random_summary": random_summary,
         "ppo_summary": ppo_summary,
@@ -1595,15 +1595,18 @@ def evaluate_agent(
     seed_offset: int,
 ) -> Dict[str, object]:
     print_section(f"第六阶段：{name} 最终评估")
+    initial_metrics_list: List[Dict[str, float]] = []
     metrics_list: List[Dict[str, float]] = []
+    initial_score_list: List[Dict[str, float]] = []
     score_list: List[Dict[str, float]] = []
+    score_gain_list: List[Dict[str, float]] = []
     rewards: List[float] = []
     heightmaps: List[np.ndarray] = []
     records: List[Dict[str, object]] = []
     env = env_factory()
 
     for index in range(num_islands):
-        state, _ = env.reset(seed=seed_offset + index)
+        state, reset_info = env.reset(seed=seed_offset + index)
         episode_reward = 0.0
         info = {}
         for _ in range(env.max_steps):
@@ -1613,15 +1616,31 @@ def evaluate_agent(
             if terminated or truncated:
                 break
 
+        initial_metrics = {key: float(value) for key, value in reset_info["metrics"].items()}
+        final_metrics = {key: float(value) for key, value in info["metrics"].items()}
+        initial_score = {key: float(value) for key, value in reset_info["score"].items()}
+        final_score = {key: float(value) for key, value in info["score"].items()}
+        score_gain = {
+            key: float(final_score[key] - initial_score[key])
+            for key in final_score.keys()
+        }
+
         rewards.append(float(episode_reward))
-        metrics_list.append(dict(info["metrics"]))
-        score_list.append(dict(info["score"]))
+        initial_metrics_list.append(initial_metrics)
+        metrics_list.append(final_metrics)
+        initial_score_list.append(initial_score)
+        score_list.append(final_score)
+        score_gain_list.append(score_gain)
         heightmaps.append(info["heightmap"])
         record = {
             "index": index + 1,
             "reward": float(episode_reward),
-            "metrics": {key: float(value) for key, value in info["metrics"].items()},
-            "score": {key: float(value) for key, value in info["score"].items()},
+            "done_reason": info.get("done_reason"),
+            "initial_metrics": initial_metrics,
+            "final_metrics": final_metrics,
+            "initial_score": initial_score,
+            "final_score": final_score,
+            "score_gain": score_gain,
         }
         records.append(record)
 
@@ -1650,6 +1669,131 @@ def evaluate_agent(
     save_json(summary, output_dir / f"{name.lower()}_evaluation_summary.json")
     save_json({"records": records}, output_dir / f"{name.lower()}_evaluation_details.json")
     return summary
+
+
+def evaluate_agent_with_gain(
+    name: str,
+    agent,
+    env_factory: Callable[[], IslandGenerationEnv],
+    output_dir: Path,
+    num_islands: int,
+    seed_offset: int,
+) -> Dict[str, object]:
+    print_section(f"{name} 最终评估（含提升量）")
+    initial_metrics_list: List[Dict[str, float]] = []
+    final_metrics_list: List[Dict[str, float]] = []
+    initial_score_list: List[Dict[str, float]] = []
+    final_score_list: List[Dict[str, float]] = []
+    score_gain_list: List[Dict[str, float]] = []
+    rewards: List[float] = []
+    heightmaps: List[np.ndarray] = []
+    records: List[Dict[str, object]] = []
+    env = env_factory()
+
+    for index in range(num_islands):
+        state, reset_info = env.reset(seed=seed_offset + index)
+        episode_reward = 0.0
+        info = dict(reset_info)
+        for _ in range(env.max_steps):
+            action = select_eval_action(agent, state)
+            state, reward, terminated, truncated, info = env.step(action)
+            episode_reward += reward
+            if terminated or truncated:
+                break
+
+        initial_metrics = {key: float(value) for key, value in reset_info["metrics"].items()}
+        final_metrics = {key: float(value) for key, value in info["metrics"].items()}
+        initial_score = {key: float(value) for key, value in reset_info["score"].items()}
+        final_score = {key: float(value) for key, value in info["score"].items()}
+        score_gain = {key: float(final_score[key] - initial_score[key]) for key in final_score.keys()}
+
+        rewards.append(float(episode_reward))
+        initial_metrics_list.append(initial_metrics)
+        final_metrics_list.append(final_metrics)
+        initial_score_list.append(initial_score)
+        final_score_list.append(final_score)
+        score_gain_list.append(score_gain)
+        heightmaps.append(info["heightmap"])
+        records.append(
+            {
+                "index": index + 1,
+                "reward": float(episode_reward),
+                "done_reason": info.get("done_reason"),
+                "initial_metrics": initial_metrics,
+                "final_metrics": final_metrics,
+                "initial_score": initial_score,
+                "final_score": final_score,
+                "score_gain": score_gain,
+            }
+        )
+
+    metric_names = list(final_metrics_list[0].keys())
+    score_names = list(final_score_list[0].keys())
+    summary = {
+        "reward_summary": summarize_rewards(rewards),
+        "initial_metric_mean": {key: float(np.mean([metrics[key] for metrics in initial_metrics_list])) for key in metric_names},
+        "final_metric_mean": {key: float(np.mean([metrics[key] for metrics in final_metrics_list])) for key in metric_names},
+        "final_metric_std": {key: float(np.std([metrics[key] for metrics in final_metrics_list])) for key in metric_names},
+        "initial_score_mean": {key: float(np.mean([score[key] for score in initial_score_list])) for key in score_names},
+        "final_score_mean": {key: float(np.mean([score[key] for score in final_score_list])) for key in score_names},
+        "score_gain_mean": {key: float(np.mean([score[key] for score in score_gain_list])) for key in score_names},
+        "score_gain_std": {key: float(np.std([score[key] for score in score_gain_list])) for key in score_names},
+        "濂栧姳缁熻": summarize_rewards(rewards),
+        "初始指标均值": {key: float(np.mean([metrics[key] for metrics in initial_metrics_list])) for key in metric_names},
+        "鎸囨爣鍧囧€?": {key: float(np.mean([metrics[key] for metrics in final_metrics_list])) for key in metric_names},
+        "鎸囨爣鏍囧噯宸?": {key: float(np.std([metrics[key] for metrics in final_metrics_list])) for key in metric_names},
+        "初始评分均值": {key: float(np.mean([score[key] for score in initial_score_list])) for key in score_names},
+        "璇勫垎鍧囧€?": {key: float(np.mean([score[key] for score in final_score_list])) for key in score_names},
+        "评分提升均值": {key: float(np.mean([score[key] for score in score_gain_list])) for key in score_names},
+        "评分提升标准差": {key: float(np.std([score[key] for score in score_gain_list])) for key in score_names},
+    }
+
+    print("初始指标均值:")
+    print_metric_dict(summary["初始指标均值"])
+    print("\n最终指标均值:")
+    print_metric_dict(summary["鎸囨爣鍧囧€?"])
+    print("\n初始评分均值:")
+    print_metric_dict(summary["初始评分均值"])
+    print("\n最终评分均值:")
+    print_metric_dict(summary["璇勫垎鍧囧€?"])
+    print("\n评分提升均值:")
+    print_metric_dict(summary["评分提升均值"])
+
+    total_scores = [record["final_score"]["total_score"] for record in records]
+    plot_dataset_samples(np.asarray(heightmaps), output_dir / f"{name.lower()}_generated_islands.png", num_samples=9)
+    plot_ranked_maps(
+        heightmaps,
+        total_scores,
+        output_dir / f"{name.lower()}_score_extremes.png",
+        title_prefix=f"{name} 最终评分样本",
+    )
+
+    save_json(summary, output_dir / f"{name.lower()}_evaluation_summary.json")
+    save_json({"records": records}, output_dir / f"{name.lower()}_evaluation_details.json")
+    return summary
+
+
+def compare_policy_summaries_with_gain(policy_summaries: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+    comparison = {
+        policy_name: {
+            "initial_total_score": float(summary["initial_score_mean"]["total_score"]),
+            "final_total_score": float(summary["final_score_mean"]["total_score"]),
+            "total_score_gain": float(summary["score_gain_mean"]["total_score"]),
+            "structure_score_gain": float(summary["score_gain_mean"]["structure_score"]),
+            "path_score_gain": float(summary["score_gain_mean"]["path_score"]),
+            "land_score_gain": float(summary["score_gain_mean"]["land_score"]),
+            "reward_mean": float(summary["reward_summary"]["mean"]),
+        }
+        for policy_name, summary in policy_summaries.items()
+    }
+
+    baseline_final_score = comparison["Zero"]["final_total_score"]
+    baseline_score_gain = comparison["Zero"]["total_score_gain"]
+    for values in comparison.values():
+        values["delta_vs_zero_final_total_score"] = float(values["final_total_score"] - baseline_final_score)
+        values["delta_vs_zero_total_score_gain"] = float(values["total_score_gain"] - baseline_score_gain)
+
+    return comparison
 
 
 def compare_policy_summaries(policy_summaries: Dict[str, Dict[str, object]]) -> Dict[str, object]:
