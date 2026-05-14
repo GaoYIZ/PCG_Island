@@ -1548,19 +1548,21 @@ def train_sac_with_logging(
         if (episode + 1) % args.sac_print_interval == 0 or episode == 0:
             reward_components = {} if last_info is None else last_info.get("reward_components", {})
             score = {} if last_info is None else last_info.get("score", {})
+            avg_episode_reward = episode_reward / max(episode_steps, 1)
             print(
-                f"Episode {episode + 1:>3} / {args.sac_episodes} | "
-                f"reward {episode_reward:.4f} | "
-                f"recent_avg {np.mean(episode_rewards[-args.sac_print_interval:]):.4f} | "
-                f"score {score.get('total_score', float('nan')):.4f} | "
-                f"delta {reward_components.get('delta_score', float('nan')):.4f} | "
-                f"best_delta {reward_components.get('best_delta', float('nan')):.4f} | "
-                f"novelty {score.get('novelty_score', float('nan')):.4f} | "
-                f"expert_delta {reward_components.get('expert_delta', float('nan')):.4f} | "
-                f"done {None if last_info is None else last_info.get('done_reason')}"
+                f"第 {episode + 1:>3} 轮 / {args.sac_episodes} 轮 | "
+                f"累计奖励 {episode_reward:.4f} | "
+                f"单步平均奖励 {avg_episode_reward:.4f} | "
+                f"最近均值 {np.mean(episode_rewards[-args.sac_print_interval:]):.4f} | "
+                f"最终总评分 {score.get('total_score', float('nan')):.4f} | "
+                f"末步增量 {reward_components.get('delta_score', float('nan')):.4f} | "
+                f"最佳增量 {reward_components.get('best_delta', float('nan')):.4f} | "
+                f"新颖性 {score.get('novelty_score', float('nan')):.4f} | "
+                f"专家距离改善 {reward_components.get('expert_delta', float('nan')):.4f} | "
+                f"结束原因 {None if last_info is None else last_info.get('done_reason')}"
             )
             print(
-                f"    reward_terms(sum): "
+                f"    奖励累计: "
                 f"delta={episode_component_sums['delta_term']:.4f}, "
                 f"best={episode_component_sums['best_term']:.4f}, "
                 f"expert={episode_component_sums['expert_term']:.4f}, "
@@ -1570,27 +1572,28 @@ def train_sac_with_logging(
                 f"stagnation=-{episode_component_sums['stagnation_penalty']:.4f}"
             )
             print(
-                f"    step_stats: "
-                f"positive_delta_steps={positive_delta_steps}/{max(episode_steps, 1)}, "
-                f"best_improve_steps={best_improve_steps}/{max(episode_steps, 1)}, "
-                f"final_structure={score.get('structure_score', float('nan')):.4f}, "
-                f"final_path={score.get('path_score', float('nan')):.4f}, "
-                f"final_land={score.get('land_score', float('nan')):.4f}, "
-                f"final_novelty={score.get('novelty_score', float('nan')):.4f}"
+                f"    奖励单步均值: "
+                f"delta={episode_component_sums['delta_term'] / max(episode_steps, 1):.4f}, "
+                f"best={episode_component_sums['best_term'] / max(episode_steps, 1):.4f}, "
+                f"expert={episode_component_sums['expert_term'] / max(episode_steps, 1):.4f}, "
+                f"step={episode_component_sums['step_penalty_term'] / max(episode_steps, 1):.4f}"
+            )
+            print(
+                f"    训练诊断: "
+                f"正增量步数={positive_delta_steps}/{max(episode_steps, 1)}, "
+                f"刷新最佳步数={best_improve_steps}/{max(episode_steps, 1)}, "
+                f"最终结构={score.get('structure_score', float('nan')):.4f}, "
+                f"最终路径={score.get('path_score', float('nan')):.4f}, "
+                f"最终面积={score.get('land_score', float('nan')):.4f}, "
+                f"最终新颖性={score.get('novelty_score', float('nan')):.4f}"
             )
             if last_losses:
                 print(
-                    f"    losses: q={last_losses.get('q_loss', float('nan')):.4f}, "
+                    f"    损失监控: q={last_losses.get('q_loss', float('nan')):.4f}, "
                     f"policy={last_losses.get('policy_loss', float('nan')):.4f}, "
                     f"alpha={last_losses.get('alpha_loss', float('nan')):.4f}, "
-                    f"alpha_val={last_losses.get('alpha', float('nan')):.4f}"
+                    f"alpha值={last_losses.get('alpha', float('nan')):.4f}"
                 )
-            continue
-            print(
-                f"第 {episode + 1:>3} 轮 / {args.sac_episodes} 轮 | "
-                f"累计奖励 {episode_reward:.4f} | "
-                f"最近10轮平均奖励 {np.mean(episode_rewards[-10:]):.4f}"
-            )
 
     live_plotter.close(episode_rewards)
     agent.save(output_dir / "sac_agent.pth")
