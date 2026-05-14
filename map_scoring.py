@@ -73,16 +73,16 @@ class MapScorer:
             },
         }
         self.structure_weights = {
-            "connectivity": 0.30,
+            "connectivity": 0.25,
             "navigable_ratio": 0.25,
-            "coast_complexity": 0.20,
+            "coast_complexity": 0.25,
             "terrain_variance": 0.25,
         }
         self.total_weights = {
-            "structure": 0.45,
-            "path": 0.20,
+            "structure": 0.35,
+            "path": 0.35,
             "land": 0.25,
-            "novelty": 0.10,
+            "novelty": 0.05,
         }
         self.novelty_scale = float(novelty_scale)
         self.novelty_k = int(max(1, novelty_k))

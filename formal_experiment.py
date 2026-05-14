@@ -116,13 +116,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expert-top-percent", type=float, default=0.10, help="Top fraction of cleaned samples saved as expert references")
     parser.add_argument("--expert-max-samples", type=int, default=256, help="Maximum number of expert samples exported and used for expert guidance")
     parser.add_argument("--novelty-reference-size", type=int, default=256, help="Maximum number of cleaned samples used as the fixed novelty reference bank")
-    parser.add_argument("--reward-delta-scale", type=float, default=12.0, help="Multiplier applied to total-score improvement between consecutive states")
-    parser.add_argument("--reward-expert-scale", type=float, default=1.5, help="Multiplier applied to movement toward expert parameter vectors")
-    parser.add_argument("--reward-step-penalty", type=float, default=0.01, help="Small per-step penalty to encourage faster convergence")
-    parser.add_argument("--reward-success-bonus", type=float, default=1.0, help="Bonus added when the success threshold is reached")
-    parser.add_argument("--reward-failure-penalty", type=float, default=0.75, help="Penalty added when the failure threshold is crossed")
-    parser.add_argument("--reward-success-threshold", type=float, default=0.78, help="Episode ends successfully once the total score reaches this threshold enough times")
-    parser.add_argument("--reward-failure-threshold", type=float, default=0.18, help="Episode fails early if the total score falls below this threshold")
+    parser.add_argument("--reward-delta-scale", type=float, default=2.0, help="Multiplier applied to total-score improvement between consecutive states")
+    parser.add_argument("--reward-best-scale", type=float, default=0.5, help="Extra reward for improving beyond the best score seen in the current episode")
+    parser.add_argument("--reward-expert-scale", type=float, default=0.0, help="Optional multiplier applied to movement toward expert parameter vectors")
+    parser.add_argument("--reward-step-penalty", type=float, default=0.005, help="Small per-step penalty to encourage faster convergence")
+    parser.add_argument("--reward-success-bonus", type=float, default=0.80, help="Bonus added when the success threshold is reached")
+    parser.add_argument("--reward-failure-penalty", type=float, default=0.80, help="Penalty added when the failure threshold is crossed")
+    parser.add_argument("--reward-stagnation-penalty", type=float, default=0.10, help="Penalty added when an episode ends due to stagnation")
+    parser.add_argument("--reward-success-threshold", type=float, default=0.70, help="Episode ends successfully once the total score reaches this threshold enough times")
+    parser.add_argument("--reward-failure-threshold", type=float, default=0.12, help="Episode fails early if the total score falls below this threshold")
     parser.add_argument("--reward-success-streak", type=int, default=2, help="Number of consecutive successful steps required for early success termination")
     parser.add_argument("--reward-stagnation-patience", type=int, default=6, help="Early-stop an episode after this many non-improving steps")
     parser.add_argument("--reward-stagnation-delta", type=float, default=1e-3, help="Minimum score improvement counted as progress")
@@ -1283,10 +1285,12 @@ def build_env_factory(
             novelty_reference_vectors=reference_bank["novelty_reference_vectors"],
             expert_param_vectors=reference_bank["expert_param_vectors"],
             reward_delta_scale=args.reward_delta_scale,
+            reward_best_scale=args.reward_best_scale,
             reward_expert_scale=args.reward_expert_scale,
             reward_step_penalty=args.reward_step_penalty,
             reward_success_bonus=args.reward_success_bonus,
             reward_failure_penalty=args.reward_failure_penalty,
+            reward_stagnation_penalty=args.reward_stagnation_penalty,
             success_score_threshold=args.reward_success_threshold,
             failure_score_threshold=args.reward_failure_threshold,
             success_streak_required=args.reward_success_streak,
@@ -1482,6 +1486,18 @@ def train_sac_with_logging(
         episode_reward = 0.0
         last_info: Optional[dict] = None
         last_losses: Dict[str, float] = {}
+        episode_component_sums = {
+            "delta_term": 0.0,
+            "best_term": 0.0,
+            "expert_term": 0.0,
+            "step_penalty_term": 0.0,
+            "success_bonus": 0.0,
+            "failure_penalty": 0.0,
+            "stagnation_penalty": 0.0,
+        }
+        positive_delta_steps = 0
+        best_improve_steps = 0
+        episode_steps = 0
 
         for _ in range(env.max_steps):
             if total_env_steps < args.sac_learning_starts:
@@ -1501,6 +1517,14 @@ def train_sac_with_logging(
             episode_reward += reward
             state = next_state
             last_info = info
+            episode_steps += 1
+            step_reward_components = info.get("reward_components", {})
+            for key in episode_component_sums:
+                episode_component_sums[key] += float(step_reward_components.get(key, 0.0))
+            if float(step_reward_components.get("delta_score", 0.0)) > 0.0:
+                positive_delta_steps += 1
+            if float(step_reward_components.get("best_delta", 0.0)) > 0.0:
+                best_improve_steps += 1
             if done:
                 break
 
@@ -1512,6 +1536,10 @@ def train_sac_with_logging(
                 "total_env_steps": int(total_env_steps),
                 "score": {} if last_info is None else last_info["score"],
                 "reward_components": {} if last_info is None else last_info["reward_components"],
+                "episode_component_sums": episode_component_sums,
+                "positive_delta_steps": int(positive_delta_steps),
+                "best_improve_steps": int(best_improve_steps),
+                "episode_steps": int(episode_steps),
                 "done_reason": None if last_info is None else last_info.get("done_reason"),
                 "losses": last_losses,
             }
@@ -1526,9 +1554,29 @@ def train_sac_with_logging(
                 f"recent_avg {np.mean(episode_rewards[-args.sac_print_interval:]):.4f} | "
                 f"score {score.get('total_score', float('nan')):.4f} | "
                 f"delta {reward_components.get('delta_score', float('nan')):.4f} | "
+                f"best_delta {reward_components.get('best_delta', float('nan')):.4f} | "
                 f"novelty {score.get('novelty_score', float('nan')):.4f} | "
                 f"expert_delta {reward_components.get('expert_delta', float('nan')):.4f} | "
                 f"done {None if last_info is None else last_info.get('done_reason')}"
+            )
+            print(
+                f"    reward_terms(sum): "
+                f"delta={episode_component_sums['delta_term']:.4f}, "
+                f"best={episode_component_sums['best_term']:.4f}, "
+                f"expert={episode_component_sums['expert_term']:.4f}, "
+                f"step={episode_component_sums['step_penalty_term']:.4f}, "
+                f"success={episode_component_sums['success_bonus']:.4f}, "
+                f"failure=-{episode_component_sums['failure_penalty']:.4f}, "
+                f"stagnation=-{episode_component_sums['stagnation_penalty']:.4f}"
+            )
+            print(
+                f"    step_stats: "
+                f"positive_delta_steps={positive_delta_steps}/{max(episode_steps, 1)}, "
+                f"best_improve_steps={best_improve_steps}/{max(episode_steps, 1)}, "
+                f"final_structure={score.get('structure_score', float('nan')):.4f}, "
+                f"final_path={score.get('path_score', float('nan')):.4f}, "
+                f"final_land={score.get('land_score', float('nan')):.4f}, "
+                f"final_novelty={score.get('novelty_score', float('nan')):.4f}"
             )
             if last_losses:
                 print(
