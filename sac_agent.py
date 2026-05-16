@@ -219,6 +219,7 @@ class SACAgent:
 
         self.q_optimizer.zero_grad()
         q_loss.backward()
+        nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
         self.q_optimizer.step()
         self._soft_update(self.q_network, self.q_target, self.tau)
 
@@ -233,6 +234,7 @@ class SACAgent:
 
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
         self.policy_optimizer.step()
 
         return policy_loss.item(), log_probs.detach()

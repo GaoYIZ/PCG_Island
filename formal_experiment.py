@@ -123,13 +123,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expert-top-percent", type=float, default=0.10, help="Top fraction of cleaned samples saved as expert references")
     parser.add_argument("--expert-max-samples", type=int, default=256, help="Maximum number of expert samples exported and used for expert guidance")
     parser.add_argument("--novelty-reference-size", type=int, default=256, help="Maximum number of cleaned samples used as the fixed novelty reference bank")
+    parser.add_argument("--rl-action-step-scale", type=float, default=0.08, help="Normalized PCG-parameter step size applied to each RL action")
+    parser.add_argument("--reward-current-scale", type=float, default=0.25, help="Small dense reward weight for the current total score")
     parser.add_argument("--reward-delta-scale", type=float, default=2.0, help="Multiplier applied to total-score improvement between consecutive states")
+    parser.add_argument("--reward-best-scale", type=float, default=1.0, help="Extra reward for improving beyond the best score seen in the current episode")
     parser.add_argument("--reward-step-penalty", type=float, default=0.002, help="Small per-step penalty to encourage faster convergence")
-    parser.add_argument("--reward-success-bonus", type=float, default=1.0, help="Bonus added when the success threshold is reached")
-    parser.add_argument("--reward-success-threshold", type=float, default=0.60, help="Episode ends successfully once the total score reaches this threshold enough times")
-    parser.add_argument("--reward-failure-threshold", type=float, default=0.15, help="Episode fails early if the total score falls below this threshold")
-    parser.add_argument("--reward-success-streak", type=int, default=2, help="Number of consecutive successful steps required for early success termination")
-    parser.add_argument("--reward-stagnation-patience", type=int, default=6, help="Early-stop an episode after this many non-improving steps")
+    parser.add_argument("--reward-success-bonus", type=float, default=0.60, help="Bonus added when the success threshold is reached")
+    parser.add_argument("--reward-success-threshold", type=float, default=0.72, help="Episode ends successfully once the total score reaches this threshold enough times")
+    parser.add_argument("--reward-failure-threshold", type=float, default=0.10, help="Episode fails early if the total score falls below this threshold")
+    parser.add_argument("--reward-success-streak", type=int, default=3, help="Number of consecutive successful steps required for early success termination")
+    parser.add_argument("--reward-stagnation-patience", type=int, default=12, help="Early-stop an episode after this many non-improving steps")
     parser.add_argument("--reward-stagnation-delta", type=float, default=1e-3, help="Minimum score improvement counted as progress")
     parser.add_argument("--eval-islands", type=int, default=12, help="Number of final evaluation islands")
     parser.add_argument("--skip-rl", action="store_true", help="Stop after VAE evaluation and skip RL/baselines")
@@ -734,6 +737,7 @@ def build_rl_reference_bank(
     feature_normalizer: IslandFeatureNormalizer,
     param_normalizer,
     output_dir: Path,
+    latent_matrix: np.ndarray | None = None,
 ) -> Dict[str, np.ndarray]:
     valid_samples = [sample for sample in clean_samples if sample.valid]
     if not valid_samples:
@@ -743,10 +747,26 @@ def build_rl_reference_bank(
     novelty_count = min(max(1, args.novelty_reference_size), len(novelty_candidates))
     novelty_indices = np.unique(np.linspace(0, len(novelty_candidates) - 1, novelty_count, dtype=int))
     novelty_samples = [novelty_candidates[int(idx)] for idx in novelty_indices]
-    novelty_reference_vectors = np.stack(
-        [feature_normalizer.transform_metrics(sample.metrics) for sample in novelty_samples],
-        axis=0,
-    ).astype(np.float32)
+    sample_to_valid_index = {id(sample): index for index, sample in enumerate(valid_samples)}
+    novelty_reference_kind = "metrics"
+    if latent_matrix is not None:
+        if len(latent_matrix) != len(valid_samples):
+            raise ValueError(
+                f"latent_matrix length must match valid sample count: {len(latent_matrix)} vs {len(valid_samples)}."
+            )
+        novelty_reference_vectors = np.stack(
+            [
+                feature_normalizer.transform_latent(latent_matrix[sample_to_valid_index[id(sample)]])
+                for sample in novelty_samples
+            ],
+            axis=0,
+        ).astype(np.float32)
+        novelty_reference_kind = "latent"
+    else:
+        novelty_reference_vectors = np.stack(
+            [feature_normalizer.transform_metrics(sample.metrics) for sample in novelty_samples],
+            axis=0,
+        ).astype(np.float32)
 
     ranked_samples = sorted(valid_samples, key=lambda sample: sample.score, reverse=True)
     expert_count = min(
@@ -773,12 +793,14 @@ def build_rl_reference_bank(
         metric_matrix=expert_metric_matrix,
         heightmaps=expert_heightmaps,
         novelty_reference_vectors=novelty_reference_vectors,
+        novelty_reference_kind=np.asarray([novelty_reference_kind]),
     )
     save_json(
         {
             "expert_count": int(expert_count),
             "expert_top_percent": float(args.expert_top_percent),
             "novelty_reference_count": int(len(novelty_reference_vectors)),
+            "novelty_reference_kind": novelty_reference_kind,
             "experts": [
                 {
                     "rank": index + 1,
@@ -800,6 +822,7 @@ def build_rl_reference_bank(
     )
     return {
         "novelty_reference_vectors": novelty_reference_vectors,
+        "novelty_reference_kind": novelty_reference_kind,
         "expert_param_vectors": expert_param_vectors,
         "expert_scores": expert_scores,
     }
@@ -1301,10 +1324,13 @@ def build_env_factory(
             vae_model=vae,
             feature_normalizer=feature_normalizer,
             include_latent=True,
+            action_step_scale=args.rl_action_step_scale,
             sampling_profile=resolve_rl_reset_profile(args),
             novelty_reference_vectors=reference_bank["novelty_reference_vectors"],
             expert_param_vectors=reference_bank["expert_param_vectors"],
+            reward_current_scale=args.reward_current_scale,
             reward_delta_scale=args.reward_delta_scale,
+            reward_best_scale=args.reward_best_scale,
             reward_step_penalty=args.reward_step_penalty,
             reward_success_bonus=args.reward_success_bonus,
             success_score_threshold=args.reward_success_threshold,
@@ -1336,12 +1362,19 @@ def run_formal_rl_experiment(
     vae = pipeline["vae"]
     feature_normalizer = pipeline["feature_normalizer"]
     vae_summary = pipeline["final_summary"]
+    rl_latents = encode_heightmaps(
+        vae,
+        arrays["heightmaps"],
+        batch_size=args.batch_size,
+        device=str(device),
+    )
     reference_bank = build_rl_reference_bank(
         args,
         clean_samples,
         feature_normalizer,
         build_rl_param_normalizer(args),
         output_dir,
+        latent_matrix=rl_latents,
     )
 
     env_factory = build_env_factory(args, vae, feature_normalizer, reference_bank)
@@ -1382,6 +1415,7 @@ def run_formal_rl_experiment(
             "rl_reset_profile": resolve_rl_reset_profile(args),
             "expert_count": int(len(reference_bank["expert_param_vectors"])),
             "novelty_reference_count": int(len(reference_bank["novelty_reference_vectors"])),
+            "novelty_reference_kind": str(reference_bank["novelty_reference_kind"]),
         },
         "policy_comparison": compare_policy_summaries_with_gain(policy_summaries),
         "zero_summary": zero_summary,
@@ -1498,7 +1532,7 @@ def train_sac_with_logging(
         critic_learning_rate=args.sac_critic_lr,
         alpha_learning_rate=args.sac_alpha_lr,
     ).to(device)
-    replay_buffer = ReplayBuffer(capacity=10000)
+    replay_buffer = ReplayBuffer(capacity=100_000)
 
     episode_rewards: List[float] = []
     episode_logs: List[dict] = []
@@ -1509,6 +1543,7 @@ def train_sac_with_logging(
         last_info: Optional[dict] = None
         last_losses: Dict[str, float] = {}
         episode_component_sums = {
+            "current_term": 0.0,
             "delta_term": 0.0,
             "best_term": 0.0,
             "expert_term": 0.0,

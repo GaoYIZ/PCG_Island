@@ -35,75 +35,65 @@ class MapScorer:
     """
     Single source of truth for terrain quality.
 
-    The same scorer is used for:
-    - dataset filtering and quality auditing
-    - direct map size evaluation via land ratio
-    - RL reward computation
+    The score follows a compact reward definition:
+    R = sum(w_i * R_i) + lambda * R_novelty.
     """
 
     def __init__(
         self,
         novelty_scale: float = 0.35,
-        novelty_k: int = 5,
-        # 高斯惩罚函数参数
-        conn_alpha: float = 2.0,            # 连通性惩罚系数 α
-        nav_mu: float = 0.90,               # 导航性理想值 μ
-        nav_sigma: float = 0.15,            # 导航性标准差 σ
-        coast_mu: float = 4.0,              # 海岸复杂度理想值
-        coast_sigma: float = 1.5,           # 海岸复杂度标准差
-        var_mu: float = 0.12,               # 地形方差理想值
-        var_sigma: float = 0.05,            # 地形方差标准差
+        novelty_k: int = 1,
+        connectivity_alpha: float = 0.35,
+        navigable_mu: float = 0.90,
+        navigable_sigma: float = 0.18,
+        coast_mu: float = 4.50,
+        coast_sigma: float = 2.75,
+        variance_mu: float = 0.13,
+        variance_sigma: float = 0.08,
+        land_mu: float = 0.30,
+        land_sigma: float = 0.20,
     ):
-        # 高斯惩罚函数参数
-        self.conn_alpha = float(conn_alpha)
-        self.nav_mu = float(nav_mu)
-        self.nav_sigma = float(nav_sigma)
-        self.coast_mu = float(coast_mu)
-        self.coast_sigma = float(coast_sigma)
-        self.var_mu = float(var_mu)
-        self.var_sigma = float(var_sigma)
-        
-        # 总权重配置：连通性和路径可达性为第一梯队，land为最后权重
+        self.connectivity_alpha = float(connectivity_alpha)
+        self.gaussian_targets = {
+            "navigable_ratio": {"mu": float(navigable_mu), "sigma": float(navigable_sigma)},
+            "coast_complexity": {"mu": float(coast_mu), "sigma": float(coast_sigma)},
+            "terrain_variance": {"mu": float(variance_mu), "sigma": float(variance_sigma)},
+            "land_ratio": {"mu": float(land_mu), "sigma": float(land_sigma)},
+        }
         self.total_weights = {
-            "connectivity": 0.25,    # 连通性 (第一梯队)
-            "navigable": 0.10,       # 导航性 (第二梯队)
-            "coast": 0.10,           # 海岸复杂度 (第三梯队)
-            "variance": 0.10,        # 地形方差 (第三梯队)
-            "path": 0.25,            # 路径可达性 (第一梯队)
-            "land": 0.05,            # 陆地比例 (最后权重)
-            "novelty": 0.15,         # 新颖性 (最后权重)
+            "connectivity": 0.30,
+            "path": 0.30,
+            "navigable": 0.14,
+            "coast": 0.10,
+            "variance": 0.10,
+            "land": 0.04,
+            "novelty": 0.02,
         }
         self.novelty_scale = float(novelty_scale)
         self.novelty_k = int(max(1, novelty_k))
 
     @staticmethod
-    def _gaussian_penalty(
-        value: float,
-        mu: float,
-        sigma: float,
-    ) -> float:
-        """高斯惩罚函数: R = exp(-(x - μ)² / σ²)"""
-        return float(np.exp(-((value - mu) ** 2) / (sigma ** 2)))
+    def _gaussian_score(value: float, mu: float, sigma: float) -> float:
+        sigma = max(float(sigma), 1e-8)
+        score = np.exp(-((float(value) - float(mu)) ** 2) / (sigma**2))
+        return float(np.clip(score, 0.0, 1.0))
 
-    @staticmethod
-    def _connectivity_gaussian(
-        connectivity: float,
-        alpha: float,
-    ) -> float:
-        """连通性高斯惩罚函数: R_conn = exp(-α(C-1)²)"""
-        return float(np.exp(-alpha * (connectivity - 1.0) ** 2))
+    def _connectivity_score(self, metrics: Mapping[str, float]) -> float:
+        if "component_count" in metrics:
+            component_count = max(float(metrics["component_count"]), 1.0)
+            score = np.exp(-self.connectivity_alpha * (component_count - 1.0) ** 2)
+            return float(np.clip(score, 0.0, 1.0))
+
+        connectivity = float(np.clip(metrics["connectivity"], 0.0, 1.0))
+        return self._gaussian_score(connectivity, mu=1.0, sigma=0.25)
 
     def describe(self) -> Dict[str, object]:
         return {
-            "gaussian_params": {
-                "conn_alpha": self.conn_alpha,
-                "nav_mu": self.nav_mu,
-                "nav_sigma": self.nav_sigma,
-                "coast_mu": self.coast_mu,
-                "coast_sigma": self.coast_sigma,
-                "var_mu": self.var_mu,
-                "var_sigma": self.var_sigma,
-            },
+            "formula": "R = sum(w_i * R_i) + lambda * R_novelty",
+            "connectivity": "exp(-alpha * (component_count - 1)^2), fallback uses connectivity ratio",
+            "path": "continuous path_reachability",
+            "gaussian_targets": self.gaussian_targets,
+            "connectivity_alpha": self.connectivity_alpha,
             "total_weights": self.total_weights,
             "novelty_scale": self.novelty_scale,
             "novelty_k": self.novelty_k,
@@ -130,13 +120,9 @@ class MapScorer:
 
         neighbor_count = min(self.novelty_k, positive_distances.size)
         nearest_distances = np.partition(positive_distances, neighbor_count - 1)[:neighbor_count]
-        neighborhood_distance = float(np.mean(nearest_distances))
-        adaptive_scale = max(
-            float(np.median(positive_distances)),
-            self.novelty_scale * float(np.sqrt(feature_vector.size)),
-            1e-6,
-        )
-        novelty_score = 1.0 - float(np.exp(-neighborhood_distance / adaptive_scale))
+        nearest_distance = float(np.mean(nearest_distances))
+        scale = max(self.novelty_scale * float(np.sqrt(feature_vector.size)), 1e-6)
+        novelty_score = nearest_distance / (nearest_distance + scale)
         return float(np.clip(novelty_score, 0.0, 1.0))
 
     def score_metrics(
@@ -145,65 +131,57 @@ class MapScorer:
         feature_vector: Optional[Sequence[float]] = None,
         history_vectors: Optional[Iterable[Sequence[float]]] = None,
     ) -> ScoreBreakdown:
-        # 基础结构奖励（使用高斯惩罚函数）
-        conn_score = self._connectivity_gaussian(
-            float(np.clip(metrics["connectivity"], 0.0, 1.0)),
-            self.conn_alpha
-        )
-        nav_score = self._gaussian_penalty(
+        connectivity_score = self._connectivity_score(metrics)
+        navigable_score = self._gaussian_score(
             metrics["navigable_ratio"],
-            self.nav_mu,
-            self.nav_sigma
+            **self.gaussian_targets["navigable_ratio"],
         )
-        coast_score = self._gaussian_penalty(
+        coast_score = self._gaussian_score(
             metrics["coast_complexity"],
-            self.coast_mu,
-            self.coast_sigma
+            **self.gaussian_targets["coast_complexity"],
         )
-        variance_score = self._gaussian_penalty(
+        variance_score = self._gaussian_score(
             metrics["terrain_variance"],
-            self.var_mu,
-            self.var_sigma
+            **self.gaussian_targets["terrain_variance"],
         )
-
-        # 路径可达奖励（连续指标）
         path_score = float(np.clip(metrics["path_reachability"], 0.0, 1.0))
-        
-        # 陆地比例奖励（使用高斯惩罚函数，理想值 0.30）
-        land_score = self._gaussian_penalty(
+        land_score = self._gaussian_score(
             metrics["land_ratio"],
-            mu=0.30,
-            sigma=0.12
+            **self.gaussian_targets["land_ratio"],
         )
-        
-        # 新颖性奖励
         novelty_score = self.compute_novelty_score(feature_vector, history_vectors)
 
-        # 总奖励函数：R = ΣwᵢRᵢ + λR_novelty（简化版，无嵌套）
         total_score = (
-            self.total_weights["connectivity"] * conn_score
-            + self.total_weights["navigable"] * nav_score
+            self.total_weights["connectivity"] * connectivity_score
+            + self.total_weights["path"] * path_score
+            + self.total_weights["navigable"] * navigable_score
             + self.total_weights["coast"] * coast_score
             + self.total_weights["variance"] * variance_score
-            + self.total_weights["path"] * path_score
             + self.total_weights["land"] * land_score
             + self.total_weights["novelty"] * novelty_score
         )
 
-        # 结构分数（前四项的加权和，仅用于参考）
         structure_score = (
-            conn_score * 0.25 + nav_score * 0.25 + coast_score * 0.25 + variance_score * 0.25
+            self.total_weights["connectivity"] * connectivity_score
+            + self.total_weights["navigable"] * navigable_score
+            + self.total_weights["coast"] * coast_score
+            + self.total_weights["variance"] * variance_score
+        ) / (
+            self.total_weights["connectivity"]
+            + self.total_weights["navigable"]
+            + self.total_weights["coast"]
+            + self.total_weights["variance"]
         )
 
         component_scores = {
-            "connectivity_score": conn_score,
-            "navigable_score": nav_score,
+            "connectivity_score": connectivity_score,
+            "navigable_score": navigable_score,
             "coast_score": coast_score,
             "variance_score": variance_score,
         }
         return ScoreBreakdown(
-            total_score=float(total_score),
-            structure_score=float(structure_score),
+            total_score=float(np.clip(total_score, 0.0, 1.0)),
+            structure_score=float(np.clip(structure_score, 0.0, 1.0)),
             path_score=path_score,
             land_score=float(land_score),
             novelty_score=float(novelty_score),
