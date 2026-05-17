@@ -91,8 +91,18 @@ class PCGIslandGenerator:
     ) -> Dict[str, tuple[float, float]]:
         ranges = dict(cls._base_param_ranges(map_size))
         if profile in {"uniform", "island"}:
+            if profile == "island":
+                sampling_ranges = cls.get_sampling_ranges(map_size, profile="island")
+                for name, (sample_low, sample_high) in sampling_ranges.items():
+                    range_low, range_high = ranges[name]
+                    ranges[name] = (min(range_low, sample_low), max(range_high, sample_high))
             return ranges
         if profile == "island_voronoi":
+            sampling_ranges = cls.get_sampling_ranges(map_size, profile="island_voronoi")
+            for name, (sample_low, sample_high) in sampling_ranges.items():
+                if name in ranges:
+                    range_low, range_high = ranges[name]
+                    ranges[name] = (min(range_low, sample_low), max(range_high, sample_high))
             ranges.update(
                 {
                     "voronoi_weight": (0.12, 0.42),

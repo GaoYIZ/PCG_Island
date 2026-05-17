@@ -33,15 +33,16 @@ class IslandGenerationEnv(gym.Env):
         sampling_profile: str = "island",
         novelty_reference_vectors: Optional[Sequence[Sequence[float]]] = None,
         expert_param_vectors: Optional[Sequence[Sequence[float]]] = None,
-        reward_current_scale: float = 0.25,
-        reward_delta_scale: float = 2.0,
-        reward_best_scale: float = 1.0,
-        reward_step_penalty: float = 0.002,
-        reward_success_bonus: float = 0.60,
+        reward_current_scale: float = 0.0,
+        reward_delta_scale: float = 5.0,
+        reward_best_scale: float = 2.0,
+        reward_step_penalty: float = 0.01,
+        reward_success_bonus: float = 1.0,
         success_score_threshold: float = 0.72,
+        success_score_gain_threshold: float = 0.03,
         failure_score_threshold: float = 0.10,
         success_streak_required: int = 3,
-        stagnation_patience: int = 12,
+        stagnation_patience: int = 5,
         stagnation_delta: float = 1e-3,
     ):
         super().__init__()
@@ -68,6 +69,7 @@ class IslandGenerationEnv(gym.Env):
         self.reward_step_penalty = float(reward_step_penalty)
         self.reward_success_bonus = float(reward_success_bonus)
         self.success_score_threshold = float(success_score_threshold)
+        self.success_score_gain_threshold = float(max(0.0, success_score_gain_threshold))
         self.failure_score_threshold = float(failure_score_threshold)
         self.success_streak_required = int(max(1, success_streak_required))
         self.stagnation_patience = int(max(1, stagnation_patience))
@@ -107,6 +109,7 @@ class IslandGenerationEnv(gym.Env):
         self.current_seed: int = 42
         self.steps = 0
         self.previous_score = None
+        self.initial_total_score = 0.0
         self.best_total_score = float("-inf")
         self.success_streak = 0
         self.stagnation_steps = 0
@@ -125,6 +128,7 @@ class IslandGenerationEnv(gym.Env):
         self.current_latent = self._encode_latent(self.current_heightmap)
         self.steps = 0
         self.previous_score = self._score_current_state()
+        self.initial_total_score = float(self.previous_score.total_score)
         self.best_total_score = float(self.previous_score.total_score)
         self.success_streak = 0
         self.stagnation_steps = 0
@@ -154,6 +158,7 @@ class IslandGenerationEnv(gym.Env):
         previous_total_score = float(self.previous_score.total_score) if self.previous_score is not None else 0.0
         current_total_score = float(score.total_score)
         delta_score = current_total_score - previous_total_score
+        score_gain_from_initial = current_total_score - float(self.initial_total_score)
         previous_best_total_score = float(self.best_total_score)
         best_delta = max(0.0, current_total_score - previous_best_total_score)
 
@@ -171,7 +176,10 @@ class IslandGenerationEnv(gym.Env):
         else:
             self.stagnation_steps += 1
 
-        if current_total_score >= self.success_score_threshold:
+        if (
+            current_total_score >= self.success_score_threshold
+            and score_gain_from_initial >= self.success_score_gain_threshold
+        ):
             self.success_streak += 1
         else:
             self.success_streak = 0
@@ -207,6 +215,7 @@ class IslandGenerationEnv(gym.Env):
                 "current_score": current_total_score,
                 "delta_score": delta_score,
                 "best_delta": best_delta,
+                "score_gain_from_initial": score_gain_from_initial,
                 "current_term": float(current_term),
                 "delta_term": float(delta_term),
                 "best_term": float(best_term),
@@ -234,6 +243,7 @@ class IslandGenerationEnv(gym.Env):
             "current_score": score,
             "delta_score": 0.0,
             "best_delta": 0.0,
+            "score_gain_from_initial": 0.0,
             "current_term": 0.0,
             "delta_term": 0.0,
             "best_term": 0.0,

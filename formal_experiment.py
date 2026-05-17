@@ -106,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-lr", type=float, default=8e-4, help="VAE learning rate")
     parser.add_argument("--ppo-episodes", type=int, default=60, help="PPO training episodes")
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="Maximum steps per PPO episode")
+    parser.add_argument("--ppo-rollout-steps", type=int, default=1024, help="Transitions collected before each PPO update")
     parser.add_argument("--ppo-hidden-dim", type=int, default=256, help="PPO hidden dimension")
     parser.add_argument("--sac-episodes", type=int, default=0, help="Extra SAC training episodes; 0 disables SAC")
     parser.add_argument(
@@ -124,15 +125,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expert-max-samples", type=int, default=256, help="Maximum number of expert samples exported and used for expert guidance")
     parser.add_argument("--novelty-reference-size", type=int, default=256, help="Maximum number of cleaned samples used as the fixed novelty reference bank")
     parser.add_argument("--rl-action-step-scale", type=float, default=0.08, help="Normalized PCG-parameter step size applied to each RL action")
-    parser.add_argument("--reward-current-scale", type=float, default=0.25, help="Small dense reward weight for the current total score")
-    parser.add_argument("--reward-delta-scale", type=float, default=2.0, help="Multiplier applied to total-score improvement between consecutive states")
-    parser.add_argument("--reward-best-scale", type=float, default=1.0, help="Extra reward for improving beyond the best score seen in the current episode")
-    parser.add_argument("--reward-step-penalty", type=float, default=0.002, help="Small per-step penalty to encourage faster convergence")
-    parser.add_argument("--reward-success-bonus", type=float, default=0.60, help="Bonus added when the success threshold is reached")
+    parser.add_argument("--reward-current-scale", type=float, default=0.0, help="Dense reward weight for current total score; 0 keeps reward focused on improvement")
+    parser.add_argument("--reward-delta-scale", type=float, default=5.0, help="Multiplier applied to total-score improvement between consecutive states")
+    parser.add_argument("--reward-best-scale", type=float, default=2.0, help="Extra reward for improving beyond the best score seen in the current episode")
+    parser.add_argument("--reward-step-penalty", type=float, default=0.01, help="Small per-step penalty to encourage faster convergence")
+    parser.add_argument("--reward-success-bonus", type=float, default=1.0, help="Bonus added when the success threshold is reached")
     parser.add_argument("--reward-success-threshold", type=float, default=0.72, help="Episode ends successfully once the total score reaches this threshold enough times")
+    parser.add_argument("--reward-success-gain-threshold", type=float, default=0.03, help="Minimum total-score gain required before success bonus/termination")
     parser.add_argument("--reward-failure-threshold", type=float, default=0.10, help="Episode fails early if the total score falls below this threshold")
     parser.add_argument("--reward-success-streak", type=int, default=3, help="Number of consecutive successful steps required for early success termination")
-    parser.add_argument("--reward-stagnation-patience", type=int, default=12, help="Early-stop an episode after this many non-improving steps")
+    parser.add_argument("--reward-stagnation-patience", type=int, default=5, help="Early-stop an episode after this many non-improving steps")
     parser.add_argument("--reward-stagnation-delta", type=float, default=1e-3, help="Minimum score improvement counted as progress")
     parser.add_argument("--eval-islands", type=int, default=12, help="Number of final evaluation islands")
     parser.add_argument("--skip-rl", action="store_true", help="Stop after VAE evaluation and skip RL/baselines")
@@ -417,6 +419,53 @@ def _draw_curve_on_axis(axis, values: Sequence[float], title: str, ylabel: str) 
     axis.grid(True, alpha=0.3)
 
 
+def _draw_optional_curve_on_axis(axis, values: Sequence[float | None], title: str, ylabel: str) -> None:
+    axis.clear()
+    points = [
+        (index, float(value))
+        for index, value in enumerate(values)
+        if value is not None and np.isfinite(float(value))
+    ]
+    if points:
+        xs, ys = zip(*points)
+        axis.plot(xs, ys, linewidth=2, alpha=0.85)
+        if len(points) >= 10:
+            moving_average = np.convolve(np.asarray(ys, dtype=np.float32), np.ones(10) / 10, mode="valid")
+            axis.plot(xs[9:], moving_average, linewidth=2, color="red", label="10轮滑动均值")
+            axis.legend()
+    axis.set_title(title)
+    axis.set_xlabel("轮次")
+    axis.set_ylabel(ylabel)
+    axis.grid(True, alpha=0.3)
+
+
+def _draw_multi_curve_on_axis(
+    axis,
+    series: Dict[str, Sequence[float | None]],
+    title: str,
+    ylabel: str,
+) -> None:
+    axis.clear()
+    has_points = False
+    for label, values in series.items():
+        points = [
+            (index, float(value))
+            for index, value in enumerate(values)
+            if value is not None and np.isfinite(float(value))
+        ]
+        if not points:
+            continue
+        xs, ys = zip(*points)
+        axis.plot(xs, ys, linewidth=2, alpha=0.85, label=label)
+        has_points = True
+    if has_points:
+        axis.legend()
+    axis.set_title(title)
+    axis.set_xlabel("episode")
+    axis.set_ylabel(ylabel)
+    axis.grid(True, alpha=0.3)
+
+
 def plot_curve(values: Sequence[float], title: str, ylabel: str, output_path: Path) -> None:
     plt.figure(figsize=(10, 5))
     axis = plt.gca()
@@ -480,6 +529,97 @@ class LiveCurvePlotter:
                 plt.close(self.figure)
             except Exception:
                 pass
+
+
+class LiveTrainingDashboard:
+    """Keeps a 2x2 training dashboard refreshed during training and saved to disk."""
+
+    def __init__(
+        self,
+        title: str,
+        output_path: Path,
+        refresh_every: int = 1,
+        ylabel: str | None = None,
+    ) -> None:
+        self.title = title
+        self.output_path = output_path
+        self.refresh_every = max(1, int(refresh_every))
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.figure = None
+        self.axes = None
+        self.interactive = False
+        try:
+            plt.ion()
+            self.figure, self.axes = plt.subplots(2, 2, figsize=(12, 8))
+            self.interactive = True
+        except Exception:
+            self.figure = None
+            self.axes = None
+            self.interactive = False
+
+    def update(self, series: Dict[str, Sequence[float | None]], force: bool = False) -> None:
+        rewards = series.get("reward", [])
+        if not rewards:
+            return
+        if not force and len(rewards) % self.refresh_every != 0:
+            return
+
+        if self.interactive and self.figure is not None and self.axes is not None:
+            axes = self.axes.flatten()
+            _draw_optional_curve_on_axis(axes[0], rewards, "Reward", "episode reward")
+            _draw_optional_curve_on_axis(axes[1], series.get("loss", []), "Loss", "loss")
+            _draw_optional_curve_on_axis(axes[2], series.get("final_score", []), "Final total_score", "score")
+            _draw_multi_curve_on_axis(
+                axes[3],
+                {
+                    "score_gain": series.get("score_gain", []),
+                    "path_score": series.get("path_score", []),
+                    "connectivity_score": series.get("connectivity_score", []),
+                },
+                "Gain / path / connectivity",
+                "score",
+            )
+            self.figure.suptitle(self.title)
+            self.figure.tight_layout()
+            self.figure.savefig(self.output_path, dpi=150, bbox_inches="tight")
+            try:
+                self.figure.canvas.draw_idle()
+                self.figure.canvas.flush_events()
+                plt.pause(0.001)
+            except Exception:
+                pass
+        else:
+            self._save_static(series)
+
+    def close(self, series: Dict[str, Sequence[float | None]]) -> None:
+        self.update(series, force=True)
+        if self.interactive and self.figure is not None:
+            try:
+                plt.close(self.figure)
+            except Exception:
+                pass
+
+    def _save_static(self, series: Dict[str, Sequence[float | None]]) -> None:
+        figure, axes_grid = plt.subplots(2, 2, figsize=(12, 8))
+        axes = axes_grid.flatten()
+        _draw_optional_curve_on_axis(axes[0], series.get("reward", []), "Reward", "episode reward")
+        _draw_optional_curve_on_axis(axes[1], series.get("loss", []), "Loss", "loss")
+        _draw_optional_curve_on_axis(axes[2], series.get("final_score", []), "Final total_score", "score")
+        _draw_multi_curve_on_axis(
+            axes[3],
+            {
+                "score_gain": series.get("score_gain", []),
+                "path_score": series.get("path_score", []),
+                "connectivity_score": series.get("connectivity_score", []),
+            },
+            "Gain / path / connectivity",
+            "score",
+        )
+        figure.suptitle(self.title)
+        figure.tight_layout()
+        figure.savefig(self.output_path, dpi=150, bbox_inches="tight")
+        plt.close(figure)
 
 
 def plot_dataset_samples(heightmaps: np.ndarray, output_path: Path, num_samples: int = 9) -> None:
@@ -826,6 +966,43 @@ def build_rl_reference_bank(
         "expert_param_vectors": expert_param_vectors,
         "expert_scores": expert_scores,
     }
+
+
+def _mean_training_loss(losses: Dict[str, float] | None) -> float | None:
+    if not losses:
+        return None
+    preferred_names = ("total_loss", "q_loss", "policy_loss", "value_loss")
+    values = [
+        abs(float(losses[name]))
+        for name in preferred_names
+        if name in losses and np.isfinite(float(losses[name]))
+    ]
+    return float(np.mean(values)) if values else None
+
+
+def _append_training_dashboard_point(
+    series: Dict[str, List[float | None]],
+    episode_reward: float,
+    losses: Dict[str, float] | None,
+    reset_info: Dict[str, object],
+    last_info: Optional[dict],
+) -> None:
+    initial_score = reset_info.get("score", {}) if reset_info is not None else {}
+    final_info = last_info or reset_info
+    final_score = final_info.get("score", {}) if final_info is not None else {}
+
+    initial_total = float(initial_score.get("total_score", np.nan))
+    final_total = float(final_score.get("total_score", np.nan))
+    score_gain = final_total - initial_total if np.isfinite(initial_total) and np.isfinite(final_total) else None
+
+    series["reward"].append(float(episode_reward))
+    series["loss"].append(_mean_training_loss(losses))
+    series["final_score"].append(final_total if np.isfinite(final_total) else None)
+    series["score_gain"].append(score_gain)
+    series["path_score"].append(float(final_score["path_score"]) if "path_score" in final_score else None)
+    series["connectivity_score"].append(
+        float(final_score["connectivity_score"]) if "connectivity_score" in final_score else None
+    )
 
 
 def train_formal_vae(
@@ -1334,6 +1511,7 @@ def build_env_factory(
             reward_step_penalty=args.reward_step_penalty,
             reward_success_bonus=args.reward_success_bonus,
             success_score_threshold=args.reward_success_threshold,
+            success_score_gain_threshold=args.reward_success_gain_threshold,
             failure_score_threshold=args.reward_failure_threshold,
             success_streak_required=args.reward_success_streak,
             stagnation_patience=args.reward_stagnation_patience,
@@ -1440,13 +1618,12 @@ def train_ppo(
     print_section("第五阶段：PPO 正式训练")
     env = env_factory()
     curve_path = output_dir / "ppo_training_curve.png"
-    live_plotter = LiveCurvePlotter(
-        title="PPO 训练奖励曲线",
-        ylabel="奖励值",
+    live_plotter = LiveTrainingDashboard(
+        title="PPO training dashboard",
         output_path=curve_path,
         refresh_every=1,
     )
-    print(f"PPO 实时奖励曲线: {curve_path.resolve()}")
+    print(f"PPO training dashboard: {curve_path.resolve()}")
     agent = PPOAgent(
         state_dim=env.observation_space.shape[0],
         action_dim=env.action_space.shape[0],
@@ -1457,9 +1634,19 @@ def train_ppo(
 
     episode_rewards: List[float] = []
     episode_logs: List[dict] = []
+    dashboard_series: Dict[str, List[float | None]] = {
+        "reward": [],
+        "loss": [],
+        "final_score": [],
+        "score_gain": [],
+        "path_score": [],
+        "connectivity_score": [],
+    }
+    rollout_memory = []
+    rollout_target_steps = max(1, int(args.ppo_rollout_steps))
 
     for episode in range(args.ppo_episodes):
-        state, _ = env.reset(seed=args.seed + episode)
+        state, reset_info = env.reset(seed=args.seed + episode)
         memory = []
         episode_reward = 0.0
         last_info: Optional[dict] = None
@@ -1477,17 +1664,25 @@ def train_ppo(
             if done:
                 break
 
-        losses = agent.update(memory)
+        rollout_memory.extend(memory)
+        should_update = len(rollout_memory) >= rollout_target_steps or episode == args.ppo_episodes - 1
+        losses = agent.update(rollout_memory) if should_update else None
+        if should_update:
+            rollout_memory = []
         episode_rewards.append(float(episode_reward))
+        _append_training_dashboard_point(dashboard_series, episode_reward, losses, reset_info, last_info)
         episode_logs.append(
             {
                 "episode": episode + 1,
                 "reward": float(episode_reward),
-                "losses": losses,
+                "losses": losses or {},
+                "updated_policy": bool(should_update),
+                "initial_score": reset_info["score"],
                 "score": last_info["score"] if last_info is not None else {},
+                "score_gain": dashboard_series["score_gain"][-1],
             }
         )
-        live_plotter.update(episode_rewards)
+        live_plotter.update(dashboard_series)
 
         if (episode + 1) % 10 == 0 or episode == 0:
             print(
@@ -1496,7 +1691,7 @@ def train_ppo(
                 f"最近10轮平均奖励 {np.mean(episode_rewards[-10:]):.4f}"
             )
 
-    live_plotter.close(episode_rewards)
+    live_plotter.close(dashboard_series)
     torch.save(agent.network.state_dict(), output_dir / "ppo_agent.pth")
     save_json(
         {
@@ -1517,13 +1712,12 @@ def train_sac_with_logging(
     print_section("补充阶段：SAC 训练")
     env = env_factory()
     curve_path = output_dir / "sac_training_curve.png"
-    live_plotter = LiveCurvePlotter(
-        title="SAC 训练奖励曲线",
-        ylabel="奖励值",
+    live_plotter = LiveTrainingDashboard(
+        title="SAC training dashboard",
         output_path=curve_path,
         refresh_every=1,
     )
-    print(f"SAC 实时奖励曲线: {curve_path.resolve()}")
+    print(f"SAC training dashboard: {curve_path.resolve()}")
     agent = SACAgent(
         state_dim=env.observation_space.shape[0],
         action_dim=env.action_space.shape[0],
@@ -1536,9 +1730,17 @@ def train_sac_with_logging(
 
     episode_rewards: List[float] = []
     episode_logs: List[dict] = []
+    dashboard_series: Dict[str, List[float | None]] = {
+        "reward": [],
+        "loss": [],
+        "final_score": [],
+        "score_gain": [],
+        "path_score": [],
+        "connectivity_score": [],
+    }
     total_env_steps = 0
     for episode in range(args.sac_episodes):
-        state, _ = env.reset(seed=args.seed + 1000 + episode)
+        state, reset_info = env.reset(seed=args.seed + 1000 + episode)
         episode_reward = 0.0
         last_info: Optional[dict] = None
         last_losses: Dict[str, float] = {}
@@ -1586,12 +1788,15 @@ def train_sac_with_logging(
                 break
 
         episode_rewards.append(float(episode_reward))
+        _append_training_dashboard_point(dashboard_series, episode_reward, last_losses, reset_info, last_info)
         episode_logs.append(
             {
                 "episode": episode + 1,
                 "reward": float(episode_reward),
                 "total_env_steps": int(total_env_steps),
+                "initial_score": reset_info["score"],
                 "score": {} if last_info is None else last_info["score"],
+                "score_gain": dashboard_series["score_gain"][-1],
                 "reward_components": {} if last_info is None else last_info["reward_components"],
                 "episode_component_sums": episode_component_sums,
                 "positive_delta_steps": int(positive_delta_steps),
@@ -1601,7 +1806,7 @@ def train_sac_with_logging(
                 "losses": last_losses,
             }
         )
-        live_plotter.update(episode_rewards)
+        live_plotter.update(dashboard_series)
         if (episode + 1) % args.sac_print_interval == 0 or episode == 0:
             reward_components = {} if last_info is None else last_info.get("reward_components", {})
             score = {} if last_info is None else last_info.get("score", {})
@@ -1652,7 +1857,7 @@ def train_sac_with_logging(
                     f"alpha值={last_losses.get('alpha', float('nan')):.4f}"
                 )
 
-    live_plotter.close(episode_rewards)
+    live_plotter.close(dashboard_series)
     agent.save(output_dir / "sac_agent.pth")
     save_json(
         {

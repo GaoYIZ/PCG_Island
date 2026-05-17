@@ -53,9 +53,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--rl-batch-size", type=int, default=16)
     parser.add_argument("--vae-epochs", type=int, default=40)
-    parser.add_argument("--ppo-episodes", type=int, default=80)
-    parser.add_argument("--ppo-max-steps", type=int, default=50)
-    parser.add_argument("--sac-episodes", type=int, default=5000)
+    parser.add_argument("--ppo-episodes", type=int, default=700)
+    parser.add_argument("--ppo-max-steps", type=int, default=15)
+    parser.add_argument("--ppo-rollout-steps", type=int, default=1024)
+    parser.add_argument("--sac-episodes", type=int, default=2000)
     parser.add_argument("--eval-islands", type=int, default=32)
     parser.add_argument(
         "--rl-reset-profile",
@@ -75,15 +76,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expert-top-percent", type=float, default=0.10)
     parser.add_argument("--expert-max-samples", type=int, default=256)
     parser.add_argument("--novelty-reference-size", type=int, default=256)
-    parser.add_argument("--reward-current-scale", type=float, default=0.25)
-    parser.add_argument("--reward-delta-scale", type=float, default=2.0)
-    parser.add_argument("--reward-best-scale", type=float, default=1.0)
-    parser.add_argument("--reward-step-penalty", type=float, default=0.002)
-    parser.add_argument("--reward-success-bonus", type=float, default=0.60)
+    parser.add_argument("--reward-current-scale", type=float, default=0.0)
+    parser.add_argument("--reward-delta-scale", type=float, default=5.0)
+    parser.add_argument("--reward-best-scale", type=float, default=2.0)
+    parser.add_argument("--reward-step-penalty", type=float, default=0.01)
+    parser.add_argument("--reward-success-bonus", type=float, default=1.0)
     parser.add_argument("--reward-success-threshold", type=float, default=0.72)
+    parser.add_argument("--reward-success-gain-threshold", type=float, default=0.03)
     parser.add_argument("--reward-failure-threshold", type=float, default=0.10)
     parser.add_argument("--reward-success-streak", type=int, default=3)
-    parser.add_argument("--reward-stagnation-patience", type=int, default=12)
+    parser.add_argument("--reward-stagnation-patience", type=int, default=5)
     parser.add_argument("--reward-stagnation-delta", type=float, default=1e-3)
 
     parser.add_argument("--reuse-best-trial", action="store_true", help="Skip Optuna when best_trial.json already exists")
@@ -161,6 +163,8 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
         str(args.ppo_episodes),
         "--ppo-max-steps",
         str(args.ppo_max_steps),
+        "--ppo-rollout-steps",
+        str(args.ppo_rollout_steps),
         "--sac-episodes",
         str(args.sac_episodes),
         "--eval-islands",
@@ -183,6 +187,8 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
         str(args.reward_success_bonus),
         "--reward-success-threshold",
         str(args.reward_success_threshold),
+        "--reward-success-gain-threshold",
+        str(args.reward_success_gain_threshold),
         "--reward-failure-threshold",
         str(args.reward_failure_threshold),
         "--reward-success-streak",
