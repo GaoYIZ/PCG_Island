@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         help="Repository root containing optuna_vae_tuning.py and formal_experiment.py",
     )
     parser.add_argument("--optuna-output-dir", type=str, default="optuna_latent64_3k_v3_voronoi_drop_connectivity")
-    parser.add_argument("--rl-output-dir", type=str, default="formal_rl_from_3k_v3_voronoi_drop_connectivity")
+    parser.add_argument("--rl-output-dir", type=str, default="formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v1")
 
     parser.add_argument("--map-size", type=int, default=64)
     parser.add_argument("--latent-dim", type=int, default=64)
@@ -52,12 +52,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--optuna-trials", type=int, default=12)
 
     parser.add_argument("--rl-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--rl-update-batch-size",
+        type=int,
+        default=64,
+        help="PPO/SAC update batch size. This is separate from --rl-batch-size, which is still the VAE batch size.",
+    )
     parser.add_argument("--vae-epochs", type=int, default=40)
-    parser.add_argument("--ppo-episodes", type=int, default=700)
+    parser.add_argument("--ppo-episodes", type=int, default=1500)
     parser.add_argument("--ppo-max-steps", type=int, default=15)
     parser.add_argument("--ppo-rollout-steps", type=int, default=1024)
-    parser.add_argument("--sac-episodes", type=int, default=2000)
-    parser.add_argument("--eval-islands", type=int, default=32)
+    parser.add_argument("--ppo-lr", type=float, default=3e-4)
+    parser.add_argument("--sac-episodes", type=int, default=4000)
+    parser.add_argument("--eval-islands", type=int, default=64)
     parser.add_argument(
         "--rl-reset-profile",
         type=str,
@@ -66,18 +73,19 @@ def parse_args() -> argparse.Namespace:
         help="Sampling profile used for RL resets.",
     )
 
-    parser.add_argument("--rl-action-step-scale", type=float, default=0.08)
-    parser.add_argument("--sac-learning-starts", type=int, default=1024)
+    parser.add_argument("--rl-action-step-scale", type=float, default=0.06)
+    parser.add_argument("--sac-learning-starts", type=int, default=4096)
     parser.add_argument("--sac-print-interval", type=int, default=25)
-    parser.add_argument("--sac-actor-lr", type=float, default=2e-4)
-    parser.add_argument("--sac-critic-lr", type=float, default=7e-4)
-    parser.add_argument("--sac-alpha-lr", type=float, default=2e-4)
+    parser.add_argument("--sac-hidden-dim", type=int, default=256)
+    parser.add_argument("--sac-actor-lr", type=float, default=1e-4)
+    parser.add_argument("--sac-critic-lr", type=float, default=3e-4)
+    parser.add_argument("--sac-alpha-lr", type=float, default=1e-4)
 
     parser.add_argument("--expert-top-percent", type=float, default=0.10)
     parser.add_argument("--expert-max-samples", type=int, default=256)
     parser.add_argument("--novelty-reference-size", type=int, default=256)
-    parser.add_argument("--reward-current-scale", type=float, default=0.0)
-    parser.add_argument("--reward-delta-scale", type=float, default=5.0)
+    parser.add_argument("--reward-current-scale", type=float, default=0.3)
+    parser.add_argument("--reward-delta-scale", type=float, default=3.0)
     parser.add_argument("--reward-best-scale", type=float, default=2.0)
     parser.add_argument("--reward-step-penalty", type=float, default=0.01)
     parser.add_argument("--reward-success-bonus", type=float, default=1.0)
@@ -87,6 +95,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-success-streak", type=int, default=3)
     parser.add_argument("--reward-stagnation-patience", type=int, default=5)
     parser.add_argument("--reward-stagnation-delta", type=float, default=1e-3)
+    parser.add_argument("--rl-best-window", type=int, default=50)
+    parser.add_argument(
+        "--restore-best-policy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate the rolling-best checkpoint instead of the last checkpoint.",
+    )
+    parser.add_argument(
+        "--tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write training scalars for TensorBoard plus CSV.",
+    )
+    parser.add_argument("--tensorboard-dir", type=str, default="")
 
     parser.add_argument("--reuse-best-trial", action="store_true", help="Skip Optuna when best_trial.json already exists")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them")
@@ -157,6 +179,8 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
         args.sampling_profile,
         "--batch-size",
         str(args.rl_batch_size),
+        "--rl-update-batch-size",
+        str(args.rl_update_batch_size),
         "--vae-epochs",
         str(args.vae_epochs),
         "--ppo-episodes",
@@ -165,6 +189,8 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
         str(args.ppo_max_steps),
         "--ppo-rollout-steps",
         str(args.ppo_rollout_steps),
+        "--ppo-lr",
+        str(args.ppo_lr),
         "--sac-episodes",
         str(args.sac_episodes),
         "--eval-islands",
@@ -199,6 +225,8 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
         str(args.reward_stagnation_delta),
         "--sac-actor-lr",
         str(args.sac_actor_lr),
+        "--sac-hidden-dim",
+        str(args.sac_hidden_dim),
         "--sac-critic-lr",
         str(args.sac_critic_lr),
         "--sac-alpha-lr",
@@ -213,9 +241,15 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
         str(args.sac_learning_starts),
         "--sac-print-interval",
         str(args.sac_print_interval),
+        "--rl-best-window",
+        str(args.rl_best_window),
         "--seed",
         str(args.seed),
     ]
+    command.append("--restore-best-policy" if args.restore_best_policy else "--no-restore-best-policy")
+    command.append("--tensorboard" if args.tensorboard else "--no-tensorboard")
+    if args.tensorboard_dir:
+        command.extend(["--tensorboard-dir", args.tensorboard_dir])
     if args.drop_connectivity_supervision:
         command.append("--drop-connectivity-supervision")
     return command

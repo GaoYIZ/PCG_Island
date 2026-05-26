@@ -14,6 +14,7 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+import csv
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -108,7 +109,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="Maximum steps per PPO episode")
     parser.add_argument("--ppo-rollout-steps", type=int, default=1024, help="Transitions collected before each PPO update")
     parser.add_argument("--ppo-hidden-dim", type=int, default=256, help="PPO hidden dimension")
+    parser.add_argument("--ppo-lr", type=float, default=3e-4, help="PPO learning rate")
     parser.add_argument("--sac-episodes", type=int, default=0, help="Extra SAC training episodes; 0 disables SAC")
+    parser.add_argument(
+        "--rl-update-batch-size",
+        type=int,
+        default=0,
+        help="Mini-batch size used by PPO/SAC updates; 0 reuses --batch-size. Keep this separate from VAE batch size.",
+    )
     parser.add_argument(
         "--rl-reset-profile",
         type=str,
@@ -116,6 +124,7 @@ def parse_args() -> argparse.Namespace:
         choices=["uniform", "island", "island_voronoi"],
         help="Sampling profile used for RL environment resets; defaults to --sampling-profile when omitted",
     )
+    parser.add_argument("--sac-hidden-dim", type=int, default=256, help="SAC hidden dimension")
     parser.add_argument("--sac-actor-lr", type=float, default=3e-4, help="Actor learning rate for SAC")
     parser.add_argument("--sac-critic-lr", type=float, default=1e-3, help="Critic learning rate for SAC")
     parser.add_argument("--sac-alpha-lr", type=float, default=3e-4, help="Entropy-temperature learning rate for SAC")
@@ -136,6 +145,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-success-streak", type=int, default=3, help="Number of consecutive successful steps required for early success termination")
     parser.add_argument("--reward-stagnation-patience", type=int, default=5, help="Early-stop an episode after this many non-improving steps")
     parser.add_argument("--reward-stagnation-delta", type=float, default=1e-3, help="Minimum score improvement counted as progress")
+    parser.add_argument("--rl-best-window", type=int, default=50, help="Rolling final-score window used for best checkpoint selection")
+    parser.add_argument(
+        "--restore-best-policy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate the best rolling-score checkpoint instead of the last checkpoint.",
+    )
+    parser.add_argument(
+        "--tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write PPO/SAC scalar logs for TensorBoard when tensorboard is installed; CSV is always written.",
+    )
+    parser.add_argument(
+        "--tensorboard-dir",
+        type=str,
+        default="",
+        help="TensorBoard output directory; defaults to <output-dir>/tensorboard.",
+    )
     parser.add_argument("--eval-islands", type=int, default=12, help="Number of final evaluation islands")
     parser.add_argument("--skip-rl", action="store_true", help="Stop after VAE evaluation and skip RL/baselines")
     parser.add_argument(
@@ -620,6 +648,109 @@ class LiveTrainingDashboard:
         figure.tight_layout()
         figure.savefig(self.output_path, dpi=150, bbox_inches="tight")
         plt.close(figure)
+
+
+class TrainingScalarLogger:
+    """Writes RL scalar logs to CSV and, when available, TensorBoard."""
+
+    def __init__(self, log_dir: Path, agent_name: str, enabled: bool = True) -> None:
+        self.log_dir = log_dir
+        self.agent_name = agent_name
+        self.enabled = bool(enabled)
+        self.rows: List[Tuple[int, str, float]] = []
+        self.writer = None
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.csv_path = self.log_dir / f"{agent_name}_scalars.csv"
+
+        if self.enabled:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+
+                self.writer = SummaryWriter(log_dir=str(self.log_dir / agent_name))
+                print(f"{agent_name.upper()} TensorBoard logdir: {(self.log_dir / agent_name).resolve()}")
+            except Exception as exc:
+                print(f"{agent_name.upper()} TensorBoard disabled ({exc}). CSV scalars will still be written.")
+
+    def add_scalar(self, tag: str, value: object, step: int) -> None:
+        number = self._to_float(value)
+        if number is None:
+            return
+        full_tag = f"{self.agent_name}/{tag}"
+        self.rows.append((int(step), full_tag, number))
+        if self.writer is not None:
+            self.writer.add_scalar(full_tag, number, int(step))
+
+    def add_dict(self, prefix: str, values: object, step: int) -> None:
+        if isinstance(values, dict):
+            for key, value in values.items():
+                child_prefix = f"{prefix}/{key}" if prefix else str(key)
+                self.add_dict(child_prefix, value, step)
+            return
+        self.add_scalar(prefix, values, step)
+
+    def close(self) -> None:
+        with self.csv_path.open("w", encoding="utf-8", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["step", "tag", "value"])
+            writer.writerows(self.rows)
+        if self.writer is not None:
+            self.writer.close()
+        print(f"{self.agent_name.upper()} scalar CSV: {self.csv_path.resolve()}")
+
+    @staticmethod
+    def _to_float(value: object) -> Optional[float]:
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float, np.floating, np.integer)):
+            number = float(value)
+            return number if np.isfinite(number) else None
+        return None
+
+
+def resolve_tensorboard_dir(args: argparse.Namespace, output_dir: Path) -> Path:
+    return Path(args.tensorboard_dir).resolve() if args.tensorboard_dir else output_dir / "tensorboard"
+
+
+def resolve_rl_update_batch_size(args: argparse.Namespace) -> int:
+    value = int(getattr(args, "rl_update_batch_size", 0) or 0)
+    return max(1, value if value > 0 else int(args.batch_size))
+
+
+def rolling_finite_mean(values: Sequence[float | None], window: int) -> Optional[float]:
+    recent = [float(value) for value in values[-max(1, int(window)) :] if value is not None and np.isfinite(value)]
+    if not recent:
+        return None
+    return float(np.mean(recent))
+
+
+def write_episode_scalars(
+    logger: TrainingScalarLogger,
+    episode: int,
+    episode_reward: float,
+    losses: Dict[str, float] | None,
+    reset_info: dict,
+    last_info: Optional[dict],
+    extra: Optional[Dict[str, object]] = None,
+) -> None:
+    logger.add_scalar("reward", episode_reward, episode)
+    if last_info is not None:
+        logger.add_dict("score", last_info.get("score", {}), episode)
+        logger.add_dict("metrics", last_info.get("metrics", {}), episode)
+        logger.add_dict("reward_components", last_info.get("reward_components", {}), episode)
+        score = last_info.get("score", {})
+        reset_score = reset_info.get("score", {})
+        logger.add_scalar(
+            "score_gain/total_score",
+            float(score.get("total_score", 0.0)) - float(reset_score.get("total_score", 0.0)),
+            episode,
+        )
+        done_reason = last_info.get("done_reason")
+        for reason in ("success_threshold", "stagnation", "max_steps", "failure_threshold"):
+            logger.add_scalar(f"done_reason/{reason}", float(done_reason == reason), episode)
+    if losses:
+        logger.add_dict("losses", losses, episode)
+    if extra:
+        logger.add_dict("extra", extra, episode)
 
 
 def plot_dataset_samples(heightmaps: np.ndarray, output_path: Path, num_samples: int = 9) -> None:
@@ -1595,6 +1726,22 @@ def run_formal_rl_experiment(
             "novelty_reference_count": int(len(reference_bank["novelty_reference_vectors"])),
             "novelty_reference_kind": str(reference_bank["novelty_reference_kind"]),
         },
+        "rl_training_config": {
+            "ppo_episodes": int(args.ppo_episodes),
+            "ppo_max_steps": int(args.ppo_max_steps),
+            "ppo_rollout_steps": int(args.ppo_rollout_steps),
+            "ppo_lr": float(args.ppo_lr),
+            "sac_episodes": int(args.sac_episodes),
+            "sac_learning_starts": int(args.sac_learning_starts),
+            "sac_actor_lr": float(args.sac_actor_lr),
+            "sac_critic_lr": float(args.sac_critic_lr),
+            "sac_alpha_lr": float(args.sac_alpha_lr),
+            "rl_update_batch_size": int(resolve_rl_update_batch_size(args)),
+            "rl_action_step_scale": float(args.rl_action_step_scale),
+            "restore_best_policy": bool(args.restore_best_policy),
+            "rl_best_window": int(args.rl_best_window),
+            "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),
+        },
         "policy_comparison": compare_policy_summaries_with_gain(policy_summaries),
         "zero_summary": zero_summary,
         "random_summary": random_summary,
@@ -1624,11 +1771,15 @@ def train_ppo(
         refresh_every=1,
     )
     print(f"PPO training dashboard: {curve_path.resolve()}")
+    rl_update_batch_size = resolve_rl_update_batch_size(args)
+    scalar_logger = TrainingScalarLogger(resolve_tensorboard_dir(args, output_dir), "ppo", enabled=args.tensorboard)
+    print(f"PPO update batch size: {rl_update_batch_size}")
     agent = PPOAgent(
         state_dim=env.observation_space.shape[0],
         action_dim=env.action_space.shape[0],
         hidden_dim=args.ppo_hidden_dim,
-        batch_size=args.batch_size,
+        learning_rate=args.ppo_lr,
+        batch_size=rl_update_batch_size,
         action_range=1.0,
     ).to(device)
 
@@ -1644,6 +1795,13 @@ def train_ppo(
     }
     rollout_memory = []
     rollout_target_steps = max(1, int(args.ppo_rollout_steps))
+    best_checkpoint = {
+        "episode": 0,
+        "rolling_final_score": float("-inf"),
+        "window": int(args.rl_best_window),
+        "path": str(output_dir / "ppo_agent_best.pth"),
+    }
+    best_path = output_dir / "ppo_agent_best.pth"
 
     for episode in range(args.ppo_episodes):
         state, reset_info = env.reset(seed=args.seed + episode)
@@ -1682,6 +1840,27 @@ def train_ppo(
                 "score_gain": dashboard_series["score_gain"][-1],
             }
         )
+        write_episode_scalars(
+            scalar_logger,
+            episode + 1,
+            float(episode_reward),
+            losses or {},
+            reset_info,
+            last_info,
+            extra={
+                "updated_policy": bool(should_update),
+                "rollout_memory_steps": len(rollout_memory),
+            },
+        )
+        rolling_score = rolling_finite_mean(dashboard_series["final_score"], args.rl_best_window)
+        if rolling_score is not None and rolling_score > float(best_checkpoint["rolling_final_score"]):
+            best_checkpoint.update(
+                {
+                    "episode": episode + 1,
+                    "rolling_final_score": float(rolling_score),
+                }
+            )
+            torch.save(agent.network.state_dict(), best_path)
         live_plotter.update(dashboard_series)
 
         if (episode + 1) % 10 == 0 or episode == 0:
@@ -1692,11 +1871,22 @@ def train_ppo(
             )
 
     live_plotter.close(dashboard_series)
+    scalar_logger.close()
+    torch.save(agent.network.state_dict(), output_dir / "ppo_agent_final.pth")
+    selected_checkpoint = "final"
+    if args.restore_best_policy and best_path.exists():
+        agent.load(str(best_path))
+        selected_checkpoint = "best"
     torch.save(agent.network.state_dict(), output_dir / "ppo_agent.pth")
     save_json(
         {
             "reward_summary": summarize_rewards(episode_rewards),
             "episodes": episode_logs,
+            "update_batch_size": int(rl_update_batch_size),
+            "learning_rate": float(args.ppo_lr),
+            "best_checkpoint": best_checkpoint,
+            "selected_checkpoint": selected_checkpoint,
+            "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),
         },
         output_dir / "ppo_training_summary.json",
     )
@@ -1718,9 +1908,13 @@ def train_sac_with_logging(
         refresh_every=1,
     )
     print(f"SAC training dashboard: {curve_path.resolve()}")
+    rl_update_batch_size = resolve_rl_update_batch_size(args)
+    scalar_logger = TrainingScalarLogger(resolve_tensorboard_dir(args, output_dir), "sac", enabled=args.tensorboard)
+    print(f"SAC update batch size: {rl_update_batch_size}")
     agent = SACAgent(
         state_dim=env.observation_space.shape[0],
         action_dim=env.action_space.shape[0],
+        hidden_dim=args.sac_hidden_dim,
         action_range=1.0,
         actor_learning_rate=args.sac_actor_lr,
         critic_learning_rate=args.sac_critic_lr,
@@ -1738,6 +1932,13 @@ def train_sac_with_logging(
         "path_score": [],
         "connectivity_score": [],
     }
+    best_checkpoint = {
+        "episode": 0,
+        "rolling_final_score": float("-inf"),
+        "window": int(args.rl_best_window),
+        "path": str(output_dir / "sac_agent_best.pth"),
+    }
+    best_path = output_dir / "sac_agent_best.pth"
     total_env_steps = 0
     for episode in range(args.sac_episodes):
         state, reset_info = env.reset(seed=args.seed + 1000 + episode)
@@ -1768,8 +1969,8 @@ def train_sac_with_logging(
 
             replay_buffer.push(state, action, reward, next_state, done)
             total_env_steps += 1
-            if total_env_steps >= args.sac_learning_starts and len(replay_buffer) >= max(256, args.batch_size * 4):
-                losses = agent.update(replay_buffer, batch_size=args.batch_size)
+            if total_env_steps >= args.sac_learning_starts and len(replay_buffer) >= max(256, rl_update_batch_size * 4):
+                losses = agent.update(replay_buffer, batch_size=rl_update_batch_size)
                 if losses is not None:
                     last_losses = {key: float(value) for key, value in losses.items()}
 
@@ -1806,6 +2007,30 @@ def train_sac_with_logging(
                 "losses": last_losses,
             }
         )
+        write_episode_scalars(
+            scalar_logger,
+            episode + 1,
+            float(episode_reward),
+            last_losses,
+            reset_info,
+            last_info,
+            extra={
+                "total_env_steps": int(total_env_steps),
+                "episode_steps": int(episode_steps),
+                "positive_delta_steps": int(positive_delta_steps),
+                "best_improve_steps": int(best_improve_steps),
+                "replay_buffer_size": int(len(replay_buffer)),
+            },
+        )
+        rolling_score = rolling_finite_mean(dashboard_series["final_score"], args.rl_best_window)
+        if rolling_score is not None and rolling_score > float(best_checkpoint["rolling_final_score"]):
+            best_checkpoint.update(
+                {
+                    "episode": episode + 1,
+                    "rolling_final_score": float(rolling_score),
+                }
+            )
+            agent.save(best_path)
         live_plotter.update(dashboard_series)
         if (episode + 1) % args.sac_print_interval == 0 or episode == 0:
             reward_components = {} if last_info is None else last_info.get("reward_components", {})
@@ -1858,6 +2083,12 @@ def train_sac_with_logging(
                 )
 
     live_plotter.close(dashboard_series)
+    scalar_logger.close()
+    agent.save(output_dir / "sac_agent_final.pth")
+    selected_checkpoint = "final"
+    if args.restore_best_policy and best_path.exists():
+        agent.load(best_path)
+        selected_checkpoint = "best"
     agent.save(output_dir / "sac_agent.pth")
     save_json(
         {
@@ -1865,9 +2096,14 @@ def train_sac_with_logging(
             "episodes": episode_logs,
             "total_env_steps": int(total_env_steps),
             "learning_starts": int(args.sac_learning_starts),
+            "update_batch_size": int(rl_update_batch_size),
+            "hidden_dim": int(args.sac_hidden_dim),
             "actor_lr": float(args.sac_actor_lr),
             "critic_lr": float(args.sac_critic_lr),
             "alpha_lr": float(args.sac_alpha_lr),
+            "best_checkpoint": best_checkpoint,
+            "selected_checkpoint": selected_checkpoint,
+            "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),
         },
         output_dir / "sac_training_summary.json",
     )
