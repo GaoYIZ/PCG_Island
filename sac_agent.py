@@ -118,6 +118,7 @@ class SACAgent:
         gamma: float = 0.99,
         tau: float = 0.005,
         alpha: float = 0.2,
+        target_entropy_scale: float = 1.0,
         action_range: float = 1.0,
     ):
         self.state_dim = int(state_dim)
@@ -141,7 +142,7 @@ class SACAgent:
         initial_log_alpha = np.log(max(float(alpha), 1e-6))
         self.log_alpha = torch.tensor([initial_log_alpha], dtype=torch.float32, requires_grad=True)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=self.alpha_lr)
-        self.target_entropy = -float(action_dim)
+        self.target_entropy = -float(action_dim) * max(float(target_entropy_scale), 0.05)
         self.alpha = float(alpha)
 
     def to(self, device) -> "SACAgent":
