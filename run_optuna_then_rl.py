@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         help="Repository root containing optuna_vae_tuning.py and formal_experiment.py",
     )
     parser.add_argument("--optuna-output-dir", type=str, default="optuna_latent64_3k_v3_voronoi_drop_connectivity")
-    parser.add_argument("--rl-output-dir", type=str, default="formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v2")
+    parser.add_argument("--rl-output-dir", type=str, default="formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v3")
 
     parser.add_argument("--map-size", type=int, default=64)
     parser.add_argument("--latent-dim", type=int, default=64)
@@ -59,12 +59,12 @@ def parse_args() -> argparse.Namespace:
         help="PPO/SAC update batch size. This is separate from --rl-batch-size, which is still the VAE batch size.",
     )
     parser.add_argument("--vae-epochs", type=int, default=40)
-    parser.add_argument("--ppo-episodes", type=int, default=2500)
-    parser.add_argument("--ppo-max-steps", type=int, default=18)
+    parser.add_argument("--ppo-episodes", type=int, default=3000)
+    parser.add_argument("--ppo-max-steps", type=int, default=20)
     parser.add_argument("--ppo-rollout-steps", type=int, default=1024)
     parser.add_argument("--ppo-lr", type=float, default=3e-4)
-    parser.add_argument("--sac-episodes", type=int, default=6000)
-    parser.add_argument("--eval-islands", type=int, default=96)
+    parser.add_argument("--sac-episodes", type=int, default=8000)
+    parser.add_argument("--eval-islands", type=int, default=128)
     parser.add_argument(
         "--rl-reset-profile",
         type=str,
@@ -73,30 +73,32 @@ def parse_args() -> argparse.Namespace:
         help="Sampling profile used for RL resets.",
     )
 
-    parser.add_argument("--rl-action-step-scale", type=float, default=0.05)
-    parser.add_argument("--sac-learning-starts", type=int, default=2048)
+    parser.add_argument("--rl-action-step-scale", type=float, default=0.045)
+    parser.add_argument("--sac-learning-starts", type=int, default=1024)
     parser.add_argument("--sac-print-interval", type=int, default=25)
     parser.add_argument("--sac-hidden-dim", type=int, default=256)
     parser.add_argument("--sac-actor-lr", type=float, default=1e-4)
     parser.add_argument("--sac-critic-lr", type=float, default=3e-4)
-    parser.add_argument("--sac-alpha-lr", type=float, default=5e-5)
-    parser.add_argument("--sac-target-entropy-scale", type=float, default=0.5)
+    parser.add_argument("--sac-alpha-lr", type=float, default=3e-5)
+    parser.add_argument("--sac-min-alpha", type=float, default=0.06)
+    parser.add_argument("--sac-target-entropy-scale", type=float, default=0.8)
+    parser.add_argument("--sac-updates-per-step", type=int, default=2)
 
     parser.add_argument("--expert-top-percent", type=float, default=0.10)
     parser.add_argument("--expert-max-samples", type=int, default=256)
     parser.add_argument("--novelty-reference-size", type=int, default=256)
-    parser.add_argument("--reward-current-scale", type=float, default=0.4)
-    parser.add_argument("--reward-delta-scale", type=float, default=2.5)
-    parser.add_argument("--reward-best-scale", type=float, default=2.0)
+    parser.add_argument("--reward-current-scale", type=float, default=0.2)
+    parser.add_argument("--reward-delta-scale", type=float, default=4.0)
+    parser.add_argument("--reward-best-scale", type=float, default=2.5)
     parser.add_argument("--reward-step-penalty", type=float, default=0.01)
     parser.add_argument("--reward-success-bonus", type=float, default=1.0)
-    parser.add_argument("--reward-success-threshold", type=float, default=0.72)
+    parser.add_argument("--reward-success-threshold", type=float, default=0.76)
     parser.add_argument("--reward-success-gain-threshold", type=float, default=0.03)
     parser.add_argument("--reward-failure-threshold", type=float, default=0.10)
     parser.add_argument("--reward-success-streak", type=int, default=3)
-    parser.add_argument("--reward-stagnation-patience", type=int, default=7)
-    parser.add_argument("--reward-stagnation-delta", type=float, default=1e-3)
-    parser.add_argument("--rl-best-window", type=int, default=50)
+    parser.add_argument("--reward-stagnation-patience", type=int, default=10)
+    parser.add_argument("--reward-stagnation-delta", type=float, default=5e-4)
+    parser.add_argument("--rl-best-window", type=int, default=100)
     parser.add_argument(
         "--restore-best-policy",
         action=argparse.BooleanOptionalAction,
@@ -238,8 +240,12 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
         str(args.sac_critic_lr),
         "--sac-alpha-lr",
         str(args.sac_alpha_lr),
+        "--sac-min-alpha",
+        str(args.sac_min_alpha),
         "--sac-target-entropy-scale",
         str(args.sac_target_entropy_scale),
+        "--sac-updates-per-step",
+        str(args.sac_updates_per_step),
         "--expert-top-percent",
         str(args.expert_top_percent),
         "--expert-max-samples",

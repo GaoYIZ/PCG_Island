@@ -128,12 +128,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sac-actor-lr", type=float, default=3e-4, help="Actor learning rate for SAC")
     parser.add_argument("--sac-critic-lr", type=float, default=1e-3, help="Critic learning rate for SAC")
     parser.add_argument("--sac-alpha-lr", type=float, default=3e-4, help="Entropy-temperature learning rate for SAC")
+    parser.add_argument("--sac-min-alpha", type=float, default=0.0, help="Lower bound for SAC entropy temperature; 0 disables clamping")
     parser.add_argument(
         "--sac-target-entropy-scale",
         type=float,
         default=1.0,
         help="Scale SAC target entropy (-action_dim * scale); lower values slow excessive entropy-temperature collapse.",
     )
+    parser.add_argument("--sac-updates-per-step", type=int, default=1, help="Number of SAC gradient updates per environment step after warmup")
     parser.add_argument("--sac-learning-starts", type=int, default=512, help="Number of environment steps collected before SAC updates start")
     parser.add_argument("--sac-print-interval", type=int, default=5, help="Episode interval for SAC progress printing")
     parser.add_argument("--expert-top-percent", type=float, default=0.10, help="Top fraction of cleaned samples saved as expert references")
@@ -1964,7 +1966,9 @@ def run_formal_rl_experiment(
             "sac_actor_lr": float(args.sac_actor_lr),
             "sac_critic_lr": float(args.sac_critic_lr),
             "sac_alpha_lr": float(args.sac_alpha_lr),
+            "sac_min_alpha": float(args.sac_min_alpha),
             "sac_target_entropy_scale": float(args.sac_target_entropy_scale),
+            "sac_updates_per_step": int(args.sac_updates_per_step),
             "rl_update_batch_size": int(resolve_rl_update_batch_size(args)),
             "rl_action_step_scale": float(args.rl_action_step_scale),
             "restore_best_policy": bool(args.restore_best_policy),
@@ -2150,6 +2154,7 @@ def train_sac_with_logging(
         critic_learning_rate=args.sac_critic_lr,
         alpha_learning_rate=args.sac_alpha_lr,
         target_entropy_scale=args.sac_target_entropy_scale,
+        min_alpha=args.sac_min_alpha,
     ).to(device)
     replay_buffer = ReplayBuffer(capacity=100_000)
 
@@ -2201,9 +2206,10 @@ def train_sac_with_logging(
             replay_buffer.push(state, action, reward, next_state, done)
             total_env_steps += 1
             if total_env_steps >= args.sac_learning_starts and len(replay_buffer) >= max(256, rl_update_batch_size * 4):
-                losses = agent.update(replay_buffer, batch_size=rl_update_batch_size)
-                if losses is not None:
-                    last_losses = {key: float(value) for key, value in losses.items()}
+                for _ in range(max(1, int(args.sac_updates_per_step))):
+                    losses = agent.update(replay_buffer, batch_size=rl_update_batch_size)
+                    if losses is not None:
+                        last_losses = {key: float(value) for key, value in losses.items()}
 
             episode_reward += reward
             state = next_state
@@ -2332,7 +2338,9 @@ def train_sac_with_logging(
             "actor_lr": float(args.sac_actor_lr),
             "critic_lr": float(args.sac_critic_lr),
             "alpha_lr": float(args.sac_alpha_lr),
+            "min_alpha": float(args.sac_min_alpha),
             "target_entropy_scale": float(args.sac_target_entropy_scale),
+            "updates_per_step": int(args.sac_updates_per_step),
             "best_checkpoint": best_checkpoint,
             "selected_checkpoint": selected_checkpoint,
             "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),

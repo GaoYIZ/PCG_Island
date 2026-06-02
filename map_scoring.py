@@ -46,12 +46,12 @@ class MapScorer:
         connectivity_alpha: float = 0.35,
         navigable_mu: float = 0.90,
         navigable_sigma: float = 0.18,
-        coast_mu: float = 4.50,
-        coast_sigma: float = 2.75,
+        coast_mu: float = 3.80,
+        coast_sigma: float = 1.70,
         variance_mu: float = 0.13,
         variance_sigma: float = 0.08,
-        land_mu: float = 0.30,
-        land_sigma: float = 0.20,
+        land_mu: float = 0.23,
+        land_sigma: float = 0.11,
     ):
         self.connectivity_alpha = float(connectivity_alpha)
         self.gaussian_targets = {
@@ -61,12 +61,12 @@ class MapScorer:
             "land_ratio": {"mu": float(land_mu), "sigma": float(land_sigma)},
         }
         self.total_weights = {
-            "connectivity": 0.30,
-            "path": 0.30,
-            "navigable": 0.14,
-            "coast": 0.10,
-            "variance": 0.10,
-            "land": 0.04,
+            "connectivity": 0.28,
+            "path": 0.28,
+            "navigable": 0.10,
+            "coast": 0.16,
+            "variance": 0.06,
+            "land": 0.08,
             "novelty": 0.02,
         }
         self.novelty_scale = float(novelty_scale)
