@@ -20,6 +20,8 @@ class StructureEvaluator:
         "coast_complexity",
         "terrain_variance",
         "path_reachability",
+        "steep_slope_ratio",
+        "coast_steep_ratio",
     )
 
     metric_names: Sequence[str] = (
@@ -29,6 +31,9 @@ class StructureEvaluator:
         "terrain_variance",
         "path_reachability",
         "land_ratio",
+        "mean_slope",
+        "steep_slope_ratio",
+        "coast_steep_ratio",
     )
     supervision_metric_names: Sequence[str] = (
         "connectivity",
@@ -37,6 +42,9 @@ class StructureEvaluator:
         "terrain_variance",
         "path_reachability",
         "land_ratio",
+        "mean_slope",
+        "steep_slope_ratio",
+        "coast_steep_ratio",
         "component_count",
     )
 
@@ -45,7 +53,7 @@ class StructureEvaluator:
         map_size: int = 128,
         water_threshold: float = 0.30,
         slope_threshold: float = 30.0,
-        height_scale: float = 3.5,
+        height_scale: float = 8.0,
         cell_size: float = 1.0,
         path_sample_points: int = 6,
         max_path_pairs: int = 8,
@@ -64,6 +72,7 @@ class StructureEvaluator:
         land_mask = heightmap > self.water_threshold
         slope = self._compute_slope(heightmap)
         navigable_mask = land_mask & (slope < self.slope_threshold)
+        coast_mask = self._calculate_land_coast_mask(land_mask)
         connectivity, component_count = self._analyze_connectivity(land_mask)
         path_reachability = self._check_path_reachability(navigable_mask, slope=slope)
 
@@ -76,6 +85,9 @@ class StructureEvaluator:
             "path_reachability": path_reachability,
             "path_exists": float(path_reachability > 0.0),
             "land_ratio": self._calculate_land_ratio(land_mask),
+            "mean_slope": self._calculate_mean_slope(slope, land_mask),
+            "steep_slope_ratio": self._calculate_steep_slope_ratio(slope, land_mask),
+            "coast_steep_ratio": self._calculate_steep_slope_ratio(slope, coast_mask),
         }
 
     def get_feature_vector(
@@ -140,6 +152,24 @@ class StructureEvaluator:
         if not np.any(land_mask):
             return 0.0
         return float(np.std(heightmap[land_mask]))
+
+    def _calculate_land_coast_mask(self, land_mask: np.ndarray) -> np.ndarray:
+        if not np.any(land_mask):
+            return np.zeros_like(land_mask, dtype=bool)
+        eroded = ndimage.binary_erosion(land_mask, structure=np.ones((3, 3), dtype=bool), border_value=0)
+        return land_mask & ~eroded
+
+    @staticmethod
+    def _calculate_mean_slope(slope: np.ndarray, mask: np.ndarray) -> float:
+        if not np.any(mask):
+            return 0.0
+        return float(np.mean(slope[mask]))
+
+    def _calculate_steep_slope_ratio(self, slope: np.ndarray, mask: np.ndarray) -> float:
+        total = float(np.sum(mask))
+        if total == 0.0:
+            return 0.0
+        return float(np.sum(mask & (slope > self.slope_threshold)) / total)
 
     def _check_path_reachability(self, navigable_mask: np.ndarray, slope: np.ndarray | None = None) -> float:
         if not np.any(navigable_mask):

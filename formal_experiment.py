@@ -53,6 +53,9 @@ STRUCTURE_SUPERVISION_WEIGHTS: Dict[str, float] = {
     "terrain_variance": 1.0,
     "path_reachability": 2.2,
     "land_ratio": 0.8,
+    "mean_slope": 1.0,
+    "steep_slope_ratio": 1.5,
+    "coast_steep_ratio": 1.6,
     "component_count": 1.8,
 }
 
@@ -147,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-best-scale", type=float, default=2.0, help="Extra reward for improving beyond the best score seen in the current episode")
     parser.add_argument("--reward-step-penalty", type=float, default=0.01, help="Small per-step penalty to encourage faster convergence")
     parser.add_argument("--reward-success-bonus", type=float, default=1.0, help="Bonus added when the success threshold is reached")
-    parser.add_argument("--reward-success-threshold", type=float, default=0.72, help="Episode ends successfully once the total score reaches this threshold enough times")
+    parser.add_argument("--reward-success-threshold", type=float, default=0.62, help="Episode ends successfully once the total score reaches this threshold enough times")
     parser.add_argument("--reward-success-gain-threshold", type=float, default=0.03, help="Minimum total-score gain required before success bonus/termination")
     parser.add_argument("--reward-failure-threshold", type=float, default=0.10, help="Episode fails early if the total score falls below this threshold")
     parser.add_argument("--reward-success-streak", type=int, default=3, help="Number of consecutive successful steps required for early success termination")
@@ -180,7 +183,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--unity-terrain-width", type=float, default=512.0, help="Unity terrain width for exported islands")
     parser.add_argument("--unity-terrain-length", type=float, default=512.0, help="Unity terrain length for exported islands")
-    parser.add_argument("--unity-terrain-height", type=float, default=80.0, help="Unity terrain height scale for exported islands")
+    parser.add_argument("--unity-terrain-height", type=float, default=45.0, help="Unity terrain height scale for exported islands")
     parser.add_argument("--unity-sea-level", type=float, default=0.30, help="Unity water level for exported islands")
     parser.add_argument("--unity-target-resolution", type=int, default=257, help="Unity Terrain heightmap resolution")
     parser.add_argument("--eval-islands", type=int, default=12, help="Number of final evaluation islands")
@@ -623,8 +626,12 @@ class LiveTrainingDashboard:
                     "score_gain": series.get("score_gain", []),
                     "path_score": series.get("path_score", []),
                     "connectivity_score": series.get("connectivity_score", []),
+                    "coast_score": series.get("coast_score", []),
+                    "land_score": series.get("land_score", []),
+                    "coast_slope_score": series.get("coast_slope_score", []),
+                    "balance_score": series.get("balance_score", []),
                 },
-                "Gain / path / connectivity",
+                "Balanced quality components",
                 "score",
             )
             self.figure.suptitle(self.title)
@@ -659,8 +666,12 @@ class LiveTrainingDashboard:
                 "score_gain": series.get("score_gain", []),
                 "path_score": series.get("path_score", []),
                 "connectivity_score": series.get("connectivity_score", []),
+                "coast_score": series.get("coast_score", []),
+                "land_score": series.get("land_score", []),
+                "coast_slope_score": series.get("coast_slope_score", []),
+                "balance_score": series.get("balance_score", []),
             },
-            "Gain / path / connectivity",
+            "Balanced quality components",
             "score",
         )
         figure.suptitle(self.title)
@@ -1364,6 +1375,12 @@ def _append_training_dashboard_point(
     series["connectivity_score"].append(
         float(final_score["connectivity_score"]) if "connectivity_score" in final_score else None
     )
+    series["coast_score"].append(float(final_score["coast_score"]) if "coast_score" in final_score else None)
+    series["land_score"].append(float(final_score["land_score"]) if "land_score" in final_score else None)
+    series["coast_slope_score"].append(
+        float(final_score["coast_slope_score"]) if "coast_slope_score" in final_score else None
+    )
+    series["balance_score"].append(float(final_score["balance_score"]) if "balance_score" in final_score else None)
 
 
 def train_formal_vae(
@@ -2026,6 +2043,10 @@ def train_ppo(
         "score_gain": [],
         "path_score": [],
         "connectivity_score": [],
+        "coast_score": [],
+        "land_score": [],
+        "coast_slope_score": [],
+        "balance_score": [],
     }
     rollout_memory = []
     rollout_target_steps = max(1, int(args.ppo_rollout_steps))
@@ -2167,6 +2188,10 @@ def train_sac_with_logging(
         "score_gain": [],
         "path_score": [],
         "connectivity_score": [],
+        "coast_score": [],
+        "land_score": [],
+        "coast_slope_score": [],
+        "balance_score": [],
     }
     best_checkpoint = {
         "episode": 0,
@@ -2590,6 +2615,16 @@ def compare_policy_summaries_with_gain(policy_summaries: Dict[str, Dict[str, obj
             "structure_score_gain": float(summary["score_gain_mean"]["structure_score"]),
             "path_score_gain": float(summary["score_gain_mean"]["path_score"]),
             "land_score_gain": float(summary["score_gain_mean"]["land_score"]),
+            "navigable_score_gain": float(summary["score_gain_mean"].get("navigable_score", 0.0)),
+            "coast_score_gain": float(summary["score_gain_mean"].get("coast_score", 0.0)),
+            "variance_score_gain": float(summary["score_gain_mean"].get("variance_score", 0.0)),
+            "slope_score_gain": float(summary["score_gain_mean"].get("slope_score", 0.0)),
+            "coast_slope_score_gain": float(summary["score_gain_mean"].get("coast_slope_score", 0.0)),
+            "balance_score_gain": float(summary["score_gain_mean"].get("balance_score", 0.0)),
+            "final_coast_complexity": float(summary["final_metric_mean"].get("coast_complexity", 0.0)),
+            "final_land_ratio": float(summary["final_metric_mean"].get("land_ratio", 0.0)),
+            "final_steep_slope_ratio": float(summary["final_metric_mean"].get("steep_slope_ratio", 0.0)),
+            "final_coast_steep_ratio": float(summary["final_metric_mean"].get("coast_steep_ratio", 0.0)),
             "reward_mean": float(summary["reward_summary"]["mean"]),
         }
         for policy_name, summary in policy_summaries.items()

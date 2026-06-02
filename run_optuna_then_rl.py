@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         help="Repository root containing optuna_vae_tuning.py and formal_experiment.py",
     )
     parser.add_argument("--optuna-output-dir", type=str, default="optuna_latent64_3k_v3_voronoi_drop_connectivity")
-    parser.add_argument("--rl-output-dir", type=str, default="formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v3")
+    parser.add_argument("--rl-output-dir", type=str, default="formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v4")
 
     parser.add_argument("--map-size", type=int, default=64)
     parser.add_argument("--latent-dim", type=int, default=64)
@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-best-scale", type=float, default=2.5)
     parser.add_argument("--reward-step-penalty", type=float, default=0.01)
     parser.add_argument("--reward-success-bonus", type=float, default=1.0)
-    parser.add_argument("--reward-success-threshold", type=float, default=0.76)
+    parser.add_argument("--reward-success-threshold", type=float, default=0.62)
     parser.add_argument("--reward-success-gain-threshold", type=float, default=0.03)
     parser.add_argument("--reward-failure-threshold", type=float, default=0.10)
     parser.add_argument("--reward-success-streak", type=int, default=3)
@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--unity-export-top-k", type=int, default=2)
     parser.add_argument("--unity-terrain-width", type=float, default=512.0)
     parser.add_argument("--unity-terrain-length", type=float, default=512.0)
-    parser.add_argument("--unity-terrain-height", type=float, default=80.0)
+    parser.add_argument("--unity-terrain-height", type=float, default=45.0)
     parser.add_argument("--unity-sea-level", type=float, default=0.30)
     parser.add_argument("--unity-target-resolution", type=int, default=257)
 

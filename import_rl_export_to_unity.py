@@ -2,7 +2,7 @@
 Import an RL-exported island package into the Unity/Tuanjie terrain project.
 
 Typical use after training:
-    python import_rl_export_to_unity.py --rl-output-dir formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v2 --agent ppo --rank 1 --open-unity
+    python import_rl_export_to_unity.py --rl-output-dir formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v4 --agent ppo --rank 1 --open-unity
 
 You can also point directly at an exported island_config.json:
     python import_rl_export_to_unity.py --config path/to/island_config.json --open-unity
@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rl-output-dir",
         type=Path,
-        default=Path("formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v2"),
+        default=Path("formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v4"),
         help="Formal RL output directory containing ppo_unity_exports/sac_unity_exports.",
     )
     parser.add_argument("--agent", choices=("ppo", "sac"), default="ppo", help="Agent export folder to import")

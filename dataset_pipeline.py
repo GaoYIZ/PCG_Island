@@ -201,10 +201,16 @@ class IslandDatasetBuilder:
             reasons.append("too_much_land")
         if metrics["connectivity"] < 0.90:
             reasons.append("weak_connectivity")
-        if metrics["path_reachability"] < 0.25:
-            reasons.append("poor_reachability")
         if metrics["terrain_variance"] < 0.04:
             reasons.append("too_flat")
-        if score < 0.45:
+        if metrics.get("steep_slope_ratio", 0.0) > 0.70:
+            reasons.append("too_steep")
+        if metrics.get("coast_steep_ratio", 0.0) > 0.75:
+            reasons.append("steep_coast")
+        if metrics.get("coast_complexity", 0.0) < 1.25:
+            reasons.append("over_simple_coast")
+        if metrics.get("coast_complexity", 0.0) > 8.50:
+            reasons.append("over_complex_coast")
+        if score < 0.20:
             reasons.append("low_quality_score")
         return reasons
