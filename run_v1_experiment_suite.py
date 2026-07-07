@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--best-trial",
         type=Path,
-        default=Path("optuna_latent64_3k_v3_voronoi_drop_connectivity") / "best_trial.json",
+        default=Path("configs") / "optuna_best_latent64_3k_v3_voronoi_drop_connectivity.json",
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
     parser.add_argument("--screen-episodes", type=int, default=1500)
@@ -121,6 +121,17 @@ def is_complete(output_dir: Path, agent: str | None = None) -> bool:
     return (output_dir / f"{agent}_training_summary.json").exists() and (
         output_dir / f"{agent}_evaluation_summary.json"
     ).exists()
+
+
+def has_reusable_assets(path: Path) -> bool:
+    return all(
+        required.exists()
+        for required in (
+            path / "artifacts" / "vae_checkpoint.pt",
+            path / "artifacts" / "feature_normalizer.json",
+            path / "expert_bank.npz",
+        )
+    )
 
 
 def run_command(
@@ -350,6 +361,41 @@ def prepare_latent_assets(args: argparse.Namespace, latent_dim: int) -> Path:
     return output_dir
 
 
+def ensure_baseline_assets(args: argparse.Namespace) -> None:
+    if has_reusable_assets(args.baseline_assets):
+        return
+    output_dir = args.output_root / "assets" / "latent_64_v1"
+    args.baseline_assets = output_dir
+    command = common_formal_args(args, output_dir, latent_dim=64, seed=42)
+    command.extend(
+        [
+            "--prepare-rl-assets-only",
+            "--dataset-samples",
+            "1000",
+            "--min-clean-samples",
+            "3000",
+            "--max-dataset-samples",
+            "12000",
+            "--vae-epochs",
+            "40",
+            "--optuna-best-trial",
+            str(args.best_trial),
+            "--preserve-latent-dim",
+            "--drop-connectivity-supervision",
+        ]
+    )
+    run_command(
+        args,
+        command,
+        output_dir,
+        "ppo_assets",
+        "latent_64_v1",
+        42,
+        None,
+        {"latent_dim": 64, "source": "restored_v1_optuna_config"},
+    )
+
+
 def run_ppo_ablations(args: argparse.Namespace) -> None:
     asset_dirs = {dim: prepare_latent_assets(args, dim) for dim in (32, 64, 128)}
     for variant, params in PPO_ABLATIONS.items():
@@ -533,10 +579,9 @@ def main() -> int:
     args.best_trial = resolve_under_workspace(args.best_trial, args.workspace)
     if not (args.workspace / "formal_experiment.py").exists():
         raise FileNotFoundError(f"formal_experiment.py not found under {args.workspace}")
-    if not args.baseline_assets.exists():
-        raise FileNotFoundError(f"v1 baseline assets not found: {args.baseline_assets}")
-    if args.stage in {"ppo-ablation", "all"} and not args.best_trial.exists() and not args.dry_run:
+    if not args.best_trial.exists() and not args.dry_run:
         raise FileNotFoundError(f"Optuna best trial not found: {args.best_trial}")
+    ensure_baseline_assets(args)
 
     if args.stage in {"sac-screen", "all"}:
         run_sac_screen(args)

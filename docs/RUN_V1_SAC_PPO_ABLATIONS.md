@@ -19,6 +19,11 @@ The stages run in this order:
 Completed runs are skipped by default. Re-running the same command continues
 the suite without overwriting finished experiments.
 
+If the archived v1 checkpoint directory is present, it is reused directly. On
+a fresh machine containing only the Git repository, the script automatically
+rebuilds the latent-64 v1 assets from the tracked v1 Optuna configuration before
+starting SAC or PPO.
+
 ## Run one stage
 
 ```powershell

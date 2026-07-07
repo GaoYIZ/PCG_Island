@@ -1,0 +1,24 @@
+{
+  "best_value": 0.08983834695125129,
+  "best_params": {
+    "beta": 0.10729700617321251,
+    "beta_start": 0.011418084409849533,
+    "free_bits": 0.002538233341657717,
+    "gradient_loss_weight": 0.29999482663909627,
+    "mask_loss_weight": 0.10931932531321092,
+    "coast_loss_weight": 0.4050089323927768,
+    "land_dice_loss_weight": 0.05314213422286522,
+    "coast_dice_loss_weight": 0.3019700548880165,
+    "structure_loss_weight": 0.8095587415959704,
+    "metric_alignment_loss_weight": 0.44163371041707167,
+    "path_reachability_supervision_weight": 1.9940414420077173,
+    "land_recon_focus_weight": 1.7725683369631895,
+    "coast_recon_focus_weight": 2.741789803598544,
+    "learning_rate": 0.0011074543462864547,
+    "warmup_epochs": 15,
+    "latent_dim": 64
+  },
+  "sampling_profile": "island_voronoi",
+  "drop_connectivity_supervision": true,
+  "source": "formal_rl_from_3k_v3_voronoi_drop_connectivity_tuned_v1"
+}
