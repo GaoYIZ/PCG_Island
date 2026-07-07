@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -109,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo-max-steps", type=int, default=30, help="Maximum steps per PPO episode")
     parser.add_argument("--ppo-rollout-steps", type=int, default=1024, help="Transitions collected before each PPO update")
     parser.add_argument("--ppo-hidden-dim", type=int, default=256, help="PPO hidden dimension")
+    parser.add_argument("--ppo-hidden-layers", type=int, default=2, help="Number of hidden layers in PPO actor and critic")
     parser.add_argument("--ppo-lr", type=float, default=3e-4, help="PPO learning rate")
     parser.add_argument("--sac-episodes", type=int, default=0, help="Extra SAC training episodes; 0 disables SAC")
     parser.add_argument(
@@ -128,6 +130,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sac-actor-lr", type=float, default=3e-4, help="Actor learning rate for SAC")
     parser.add_argument("--sac-critic-lr", type=float, default=1e-3, help="Critic learning rate for SAC")
     parser.add_argument("--sac-alpha-lr", type=float, default=3e-4, help="Entropy-temperature learning rate for SAC")
+    parser.add_argument("--sac-min-alpha", type=float, default=0.0, help="Optional lower bound for SAC entropy temperature")
+    parser.add_argument(
+        "--sac-target-entropy-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to SAC target entropy (-action_dim * scale)",
+    )
     parser.add_argument("--sac-learning-starts", type=int, default=512, help="Number of environment steps collected before SAC updates start")
     parser.add_argument("--sac-print-interval", type=int, default=5, help="Episode interval for SAC progress printing")
     parser.add_argument("--expert-top-percent", type=float, default=0.10, help="Top fraction of cleaned samples saved as expert references")
@@ -175,6 +184,34 @@ def parse_args() -> argparse.Namespace:
         "--formal-rl",
         action="store_true",
         help="Run the formal VAE split pipeline first, then train/evaluate RL with the frozen VAE.",
+    )
+    parser.add_argument(
+        "--rl-agent",
+        choices=["ppo", "sac", "both"],
+        default="both",
+        help="Train PPO only, SAC only, or both agents.",
+    )
+    parser.add_argument(
+        "--include-latent-state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include the VAE latent vector in the policy observation.",
+    )
+    parser.add_argument(
+        "--reuse-rl-assets-from",
+        type=str,
+        default="",
+        help="Reuse VAE, normalizer, and expert bank from an existing formal RL output directory.",
+    )
+    parser.add_argument(
+        "--prepare-rl-assets-only",
+        action="store_true",
+        help="Build formal VAE and RL reference assets, then stop before agent training.",
+    )
+    parser.add_argument(
+        "--preserve-latent-dim",
+        action="store_true",
+        help="Keep --latent-dim when applying an Optuna trial; used for latent-capacity ablations.",
     )
     parser.add_argument("--vae-train-ratio", type=float, default=0.70, help="Train split ratio for formal VAE-only evaluation")
     parser.add_argument("--vae-val-ratio", type=float, default=0.15, help="Validation split ratio for formal VAE-only evaluation")
@@ -225,7 +262,7 @@ def apply_formal_rl_preset(args: argparse.Namespace) -> None:
         args.vae_epochs = 50
     if args.batch_size == 32:
         args.batch_size = 16
-    if args.sac_episodes == 0:
+    if args.sac_episodes == 0 and getattr(args, "rl_agent", "both") in {"sac", "both"}:
         args.sac_episodes = 80
     if args.eval_islands == 12:
         args.eval_islands = 24
@@ -234,8 +271,6 @@ def apply_formal_rl_preset(args: argparse.Namespace) -> None:
 def apply_optuna_best_trial(args: argparse.Namespace) -> None:
     if not args.optuna_best_trial:
         return
-
-    import json
 
     trial_path = Path(args.optuna_best_trial)
     if not trial_path.exists():
@@ -265,6 +300,8 @@ def apply_optuna_best_trial(args: argparse.Namespace) -> None:
         "learning_rate": "vae_lr",
     }
     for source_name, target_name in mapping.items():
+        if source_name == "latent_dim" and getattr(args, "preserve_latent_dim", False):
+            continue
         if source_name in best_params:
             setattr(args, target_name, best_params[source_name])
 
@@ -1444,6 +1481,110 @@ def save_trained_vae_artifacts(
     save_json(feature_normalizer.to_dict(), artifact_dir / "feature_normalizer.json")
 
 
+def _load_torch_checkpoint(path: Path, device: torch.device) -> dict:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def load_reusable_rl_assets(
+    args: argparse.Namespace,
+    source_dir: Path,
+    device: torch.device,
+) -> Dict[str, object]:
+    source_dir = source_dir.resolve()
+    checkpoint_path = source_dir / "artifacts" / "vae_checkpoint.pt"
+    normalizer_path = source_dir / "artifacts" / "feature_normalizer.json"
+    expert_bank_path = source_dir / "expert_bank.npz"
+    for path in (checkpoint_path, normalizer_path, expert_bank_path):
+        if not path.exists():
+            raise FileNotFoundError(f"Required reusable RL asset not found: {path}")
+
+    checkpoint = _load_torch_checkpoint(checkpoint_path, device)
+    checkpoint_map_size = int(checkpoint["map_size"])
+    checkpoint_latent_dim = int(checkpoint["latent_dim"])
+    if int(args.map_size) != checkpoint_map_size:
+        raise ValueError(
+            f"Map size mismatch for reusable assets: command={args.map_size}, checkpoint={checkpoint_map_size}."
+        )
+    if int(args.latent_dim) != checkpoint_latent_dim:
+        raise ValueError(
+            f"Latent dimension mismatch for reusable assets: command={args.latent_dim}, checkpoint={checkpoint_latent_dim}."
+        )
+
+    vae_config = dict(checkpoint.get("vae_config", {}))
+    supervision_names = list(vae_config.get("supervision_metric_names", []))
+    supervision_weight_map = dict(vae_config.get("structure_supervision_weights", {}))
+    structure_weights = [float(supervision_weight_map.get(name, 1.0)) for name in supervision_names]
+    vae = BetaVAE(
+        map_size=checkpoint_map_size,
+        latent_dim=checkpoint_latent_dim,
+        beta=float(vae_config.get("beta", args.vae_beta)),
+        beta_start=float(vae_config.get("beta_start", args.vae_beta_start)),
+        free_bits=float(vae_config.get("free_bits", args.vae_free_bits)),
+        gradient_loss_weight=float(vae_config.get("gradient_loss_weight", args.vae_gradient_loss_weight)),
+        mask_loss_weight=float(vae_config.get("mask_loss_weight", args.vae_mask_loss_weight)),
+        coast_loss_weight=float(vae_config.get("coast_loss_weight", args.vae_coast_loss_weight)),
+        land_dice_loss_weight=float(vae_config.get("land_dice_loss_weight", args.vae_land_dice_loss_weight)),
+        coast_dice_loss_weight=float(vae_config.get("coast_dice_loss_weight", args.vae_coast_dice_loss_weight)),
+        structure_dim=len(supervision_names),
+        structure_loss_weight=float(vae_config.get("structure_loss_weight", args.vae_structure_loss_weight)),
+        metric_alignment_loss_weight=float(
+            vae_config.get("metric_alignment_loss_weight", args.vae_metric_alignment_loss_weight)
+        ),
+        structure_loss_weights=structure_weights,
+        land_recon_focus_weight=float(
+            vae_config.get("land_recon_focus_weight", args.vae_land_recon_focus_weight)
+        ),
+        coast_recon_focus_weight=float(
+            vae_config.get("coast_recon_focus_weight", args.vae_coast_recon_focus_weight)
+        ),
+    ).to(device)
+    vae.load_state_dict(checkpoint["state_dict"])
+    vae.eval()
+
+    normalizer_data = json.loads(normalizer_path.read_text(encoding="utf-8"))
+    feature_normalizer = IslandFeatureNormalizer.from_dict(normalizer_data)
+    if feature_normalizer.latent_normalizer.mean is None:
+        raise ValueError(f"Reusable feature normalizer has no latent statistics: {normalizer_path}")
+    if len(feature_normalizer.latent_normalizer.mean) != checkpoint_latent_dim:
+        raise ValueError(
+            "Reusable normalizer latent dimension does not match checkpoint: "
+            f"{len(feature_normalizer.latent_normalizer.mean)} vs {checkpoint_latent_dim}."
+        )
+
+    with np.load(expert_bank_path) as bank:
+        novelty_reference_vectors = np.asarray(bank["novelty_reference_vectors"], dtype=np.float32)
+        expert_param_vectors = np.asarray(bank["normalized_params"], dtype=np.float32)
+        expert_scores = np.asarray(bank["quality_scores"], dtype=np.float32)
+        novelty_reference_kind = str(np.asarray(bank["novelty_reference_kind"]).reshape(-1)[0])
+    if novelty_reference_kind == "latent" and novelty_reference_vectors.shape[1] != checkpoint_latent_dim:
+        raise ValueError(
+            "Reusable novelty bank latent dimension does not match checkpoint: "
+            f"{novelty_reference_vectors.shape[1]} vs {checkpoint_latent_dim}."
+        )
+
+    vae_summary_path = source_dir / "vae_final_summary.json"
+    vae_summary = (
+        json.loads(vae_summary_path.read_text(encoding="utf-8"))
+        if vae_summary_path.exists()
+        else {"mode": "reused_rl_assets", "source_dir": str(source_dir)}
+    )
+    return {
+        "vae": vae,
+        "feature_normalizer": feature_normalizer,
+        "reference_bank": {
+            "novelty_reference_vectors": novelty_reference_vectors,
+            "novelty_reference_kind": novelty_reference_kind,
+            "expert_param_vectors": expert_param_vectors,
+            "expert_scores": expert_scores,
+        },
+        "vae_summary": vae_summary,
+        "source_dir": source_dir,
+    }
+
+
 def run_formal_vae_pipeline(
     args: argparse.Namespace,
     builder: IslandDatasetBuilder,
@@ -1631,7 +1772,8 @@ def build_env_factory(
             max_steps=args.ppo_max_steps,
             vae_model=vae,
             feature_normalizer=feature_normalizer,
-            include_latent=True,
+            include_latent=args.include_latent_state,
+            latent_novelty=True,
             action_step_scale=args.rl_action_step_scale,
             sampling_profile=resolve_rl_reset_profile(args),
             novelty_reference_vectors=reference_bank["novelty_reference_vectors"],
@@ -1650,6 +1792,116 @@ def build_env_factory(
         )
 
     return factory
+
+
+def run_rl_agents_with_assets(
+    args: argparse.Namespace,
+    builder: IslandDatasetBuilder,
+    vae: BetaVAE,
+    feature_normalizer: IslandFeatureNormalizer,
+    reference_bank: Dict[str, np.ndarray],
+    vae_summary: Dict[str, object],
+    output_dir: Path,
+    device: torch.device,
+    asset_source: Optional[Path] = None,
+) -> Dict[str, object]:
+    env_factory = build_env_factory(args, vae, feature_normalizer, reference_bank)
+    zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
+    random_policy = RandomPolicy(action_dim=len(builder.param_normalizer.param_names), seed=args.seed + 3000)
+    zero_summary = evaluate_agent_with_gain("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
+    random_summary = evaluate_agent_with_gain("Random", random_policy, env_factory, output_dir, args.eval_islands, args.seed + 1500)
+
+    ppo_summary = None
+    if args.rl_agent in {"ppo", "both"}:
+        ppo_agent, _, _ = train_ppo(args, env_factory, output_dir, device)
+        ppo_summary = evaluate_agent_with_gain(
+            "PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000
+        )
+
+    sac_summary = None
+    if args.rl_agent in {"sac", "both"} and args.sac_episodes > 0:
+        sac_agent, _ = train_sac_with_logging(args, env_factory, output_dir, device)
+        sac_summary = evaluate_agent_with_gain("SAC", sac_agent, env_factory, output_dir, args.eval_islands, args.seed + 4000)
+
+    policy_summaries = {
+        "Zero": zero_summary,
+        "Random": random_summary,
+    }
+    if ppo_summary is not None:
+        policy_summaries["PPO"] = ppo_summary
+    if sac_summary is not None:
+        policy_summaries["SAC"] = sac_summary
+
+    env = env_factory()
+    state_components = ["theta_norm", "metrics_norm"]
+    if args.include_latent_state:
+        state_components.insert(1, "z_norm")
+    final_summary: Dict[str, object] = {
+        "mode": "formal_rl",
+        "vae_pipeline_summary": vae_summary,
+        "state_definition": {
+            "components": state_components,
+            "param_dim": len(builder.param_normalizer.param_names),
+            "latent_dim": int(vae.latent_dim) if args.include_latent_state else 0,
+            "encoder_latent_dim": int(vae.latent_dim),
+            "metric_dim": len(builder.evaluator.metric_names),
+            "state_dim": int(env.observation_space.shape[0]),
+            "action": "delta_theta_norm",
+        },
+        "reward_definition": builder.scorer.describe(),
+        "rl_reference_bank": {
+            "rl_reset_profile": resolve_rl_reset_profile(args),
+            "expert_count": int(len(reference_bank["expert_param_vectors"])),
+            "novelty_reference_count": int(len(reference_bank["novelty_reference_vectors"])),
+            "novelty_reference_kind": str(reference_bank["novelty_reference_kind"]),
+        },
+        "rl_training_config": {
+            "ppo_episodes": int(args.ppo_episodes),
+            "ppo_max_steps": int(args.ppo_max_steps),
+            "ppo_rollout_steps": int(args.ppo_rollout_steps),
+            "ppo_hidden_dim": int(args.ppo_hidden_dim),
+            "ppo_hidden_layers": int(args.ppo_hidden_layers),
+            "ppo_lr": float(args.ppo_lr),
+            "sac_episodes": int(args.sac_episodes),
+            "sac_learning_starts": int(args.sac_learning_starts),
+            "sac_actor_lr": float(args.sac_actor_lr),
+            "sac_critic_lr": float(args.sac_critic_lr),
+            "sac_alpha_lr": float(args.sac_alpha_lr),
+            "sac_min_alpha": float(args.sac_min_alpha),
+            "sac_target_entropy_scale": float(args.sac_target_entropy_scale),
+            "rl_update_batch_size": int(resolve_rl_update_batch_size(args)),
+            "rl_action_step_scale": float(args.rl_action_step_scale),
+            "rl_agent": args.rl_agent,
+            "include_latent_state": bool(args.include_latent_state),
+            "asset_source": None if asset_source is None else str(asset_source.resolve()),
+            "restore_best_policy": bool(args.restore_best_policy),
+            "rl_best_window": int(args.rl_best_window),
+            "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),
+        },
+        "policy_comparison": compare_policy_summaries_with_gain(policy_summaries),
+        "zero_summary": zero_summary,
+        "random_summary": random_summary,
+    }
+    if ppo_summary is not None:
+        final_summary["ppo_summary"] = ppo_summary
+    if sac_summary is not None:
+        final_summary["sac_summary"] = sac_summary
+
+    save_json(vae_summary, output_dir / "vae_final_summary.json")
+    save_json(final_summary, output_dir / "final_summary.json")
+    save_json(final_summary["policy_comparison"], output_dir / "policy_comparison.json")
+    save_json(
+        {
+            "mode": "rl_experiment",
+            "seed": int(args.seed),
+            "agent": args.rl_agent,
+            "include_latent_state": bool(args.include_latent_state),
+            "ppo_hidden_layers": int(args.ppo_hidden_layers),
+            "asset_source": None if asset_source is None else str(asset_source.resolve()),
+        },
+        output_dir / "experiment_manifest.json",
+    )
+    return final_summary
 
 
 def run_formal_rl_experiment(
@@ -1685,75 +1937,60 @@ def run_formal_rl_experiment(
         output_dir,
         latent_matrix=rl_latents,
     )
-
-    env_factory = build_env_factory(args, vae, feature_normalizer, reference_bank)
-    zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
-    random_policy = RandomPolicy(action_dim=len(builder.param_normalizer.param_names), seed=args.seed + 3000)
-    zero_summary = evaluate_agent_with_gain("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
-    random_summary = evaluate_agent_with_gain("Random", random_policy, env_factory, output_dir, args.eval_islands, args.seed + 1500)
-
-    ppo_agent, _, _ = train_ppo(args, env_factory, output_dir, device)
-    ppo_summary = evaluate_agent_with_gain("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000)
-
-    sac_summary = None
-    if args.sac_episodes > 0:
-        sac_agent, _ = train_sac_with_logging(args, env_factory, output_dir, device)
-        sac_summary = evaluate_agent_with_gain("SAC", sac_agent, env_factory, output_dir, args.eval_islands, args.seed + 4000)
-
-    policy_summaries = {
-        "Zero": zero_summary,
-        "Random": random_summary,
-        "PPO": ppo_summary,
-    }
-    if sac_summary is not None:
-        policy_summaries["SAC"] = sac_summary
-
-    final_summary: Dict[str, object] = {
-        "mode": "formal_rl",
-        "vae_pipeline_summary": vae_summary,
-        "state_definition": {
-            "components": ["theta_norm", "z_norm", "metrics_norm"],
-            "param_dim": len(builder.param_normalizer.param_names),
-            "latent_dim": int(vae.latent_dim),
-            "metric_dim": len(builder.evaluator.metric_names),
-            "state_dim": len(builder.param_normalizer.param_names) + int(vae.latent_dim) + len(builder.evaluator.metric_names),
-            "action": "delta_theta_norm",
-        },
-        "reward_definition": builder.scorer.describe(),
-        "rl_reference_bank": {
-            "rl_reset_profile": resolve_rl_reset_profile(args),
+    if args.prepare_rl_assets_only:
+        summary = {
+            "mode": "rl_assets_only",
+            "map_size": int(args.map_size),
+            "latent_dim": int(args.latent_dim),
+            "sampling_profile": args.sampling_profile,
             "expert_count": int(len(reference_bank["expert_param_vectors"])),
             "novelty_reference_count": int(len(reference_bank["novelty_reference_vectors"])),
             "novelty_reference_kind": str(reference_bank["novelty_reference_kind"]),
-        },
-        "rl_training_config": {
-            "ppo_episodes": int(args.ppo_episodes),
-            "ppo_max_steps": int(args.ppo_max_steps),
-            "ppo_rollout_steps": int(args.ppo_rollout_steps),
-            "ppo_lr": float(args.ppo_lr),
-            "sac_episodes": int(args.sac_episodes),
-            "sac_learning_starts": int(args.sac_learning_starts),
-            "sac_actor_lr": float(args.sac_actor_lr),
-            "sac_critic_lr": float(args.sac_critic_lr),
-            "sac_alpha_lr": float(args.sac_alpha_lr),
-            "rl_update_batch_size": int(resolve_rl_update_batch_size(args)),
-            "rl_action_step_scale": float(args.rl_action_step_scale),
-            "restore_best_policy": bool(args.restore_best_policy),
-            "rl_best_window": int(args.rl_best_window),
-            "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),
-        },
-        "policy_comparison": compare_policy_summaries_with_gain(policy_summaries),
-        "zero_summary": zero_summary,
-        "random_summary": random_summary,
-        "ppo_summary": ppo_summary,
-    }
-    if sac_summary is not None:
-        final_summary["sac_summary"] = sac_summary
+            "vae_pipeline_summary": vae_summary,
+        }
+        save_json(vae_summary, output_dir / "vae_final_summary.json")
+        save_json(summary, output_dir / "final_summary.json")
+        save_json(summary, output_dir / "rl_assets_ready.json")
+        return summary
+    return run_rl_agents_with_assets(
+        args=args,
+        builder=builder,
+        vae=vae,
+        feature_normalizer=feature_normalizer,
+        reference_bank=reference_bank,
+        vae_summary=vae_summary,
+        output_dir=output_dir,
+        device=device,
+    )
 
-    save_json(vae_summary, output_dir / "vae_final_summary.json")
-    save_json(final_summary, output_dir / "final_summary.json")
-    save_json(final_summary["policy_comparison"], output_dir / "policy_comparison.json")
-    return final_summary
+
+def run_formal_rl_with_reused_assets(
+    args: argparse.Namespace,
+    output_dir: Path,
+    device: torch.device,
+) -> Dict[str, object]:
+    source_dir = Path(args.reuse_rl_assets_from)
+    assets = load_reusable_rl_assets(args, source_dir, device)
+    builder = IslandDatasetBuilder(
+        map_size=args.map_size,
+        sampling_profile=resolve_rl_reset_profile(args),
+    )
+    if tuple(builder.evaluator.metric_names) != tuple(assets["feature_normalizer"].metric_names):
+        raise ValueError(
+            "Reusable normalizer metric names do not match the restored v1 evaluator: "
+            f"{assets['feature_normalizer'].metric_names} vs {builder.evaluator.metric_names}."
+        )
+    return run_rl_agents_with_assets(
+        args=args,
+        builder=builder,
+        vae=assets["vae"],
+        feature_normalizer=assets["feature_normalizer"],
+        reference_bank=assets["reference_bank"],
+        vae_summary=assets["vae_summary"],
+        output_dir=output_dir,
+        device=device,
+        asset_source=assets["source_dir"],
+    )
 
 
 def train_ppo(
@@ -1778,6 +2015,7 @@ def train_ppo(
         state_dim=env.observation_space.shape[0],
         action_dim=env.action_space.shape[0],
         hidden_dim=args.ppo_hidden_dim,
+        hidden_layers=args.ppo_hidden_layers,
         learning_rate=args.ppo_lr,
         batch_size=rl_update_batch_size,
         action_range=1.0,
@@ -1884,6 +2122,9 @@ def train_ppo(
             "episodes": episode_logs,
             "update_batch_size": int(rl_update_batch_size),
             "learning_rate": float(args.ppo_lr),
+            "hidden_dim": int(args.ppo_hidden_dim),
+            "hidden_layers": int(args.ppo_hidden_layers),
+            "state_dim": int(env.observation_space.shape[0]),
             "best_checkpoint": best_checkpoint,
             "selected_checkpoint": selected_checkpoint,
             "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),
@@ -1919,6 +2160,8 @@ def train_sac_with_logging(
         actor_learning_rate=args.sac_actor_lr,
         critic_learning_rate=args.sac_critic_lr,
         alpha_learning_rate=args.sac_alpha_lr,
+        min_alpha=args.sac_min_alpha,
+        target_entropy_scale=args.sac_target_entropy_scale,
     ).to(device)
     replay_buffer = ReplayBuffer(capacity=100_000)
 
@@ -2101,6 +2344,9 @@ def train_sac_with_logging(
             "actor_lr": float(args.sac_actor_lr),
             "critic_lr": float(args.sac_critic_lr),
             "alpha_lr": float(args.sac_alpha_lr),
+            "min_alpha": float(args.sac_min_alpha),
+            "target_entropy_scale": float(args.sac_target_entropy_scale),
+            "state_dim": int(env.observation_space.shape[0]),
             "best_checkpoint": best_checkpoint,
             "selected_checkpoint": selected_checkpoint,
             "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),
@@ -2387,11 +2633,27 @@ def main() -> None:
     print(f"VAE ??????        : {args.vae_epochs}")
     print(f"PPO ??????        : {args.ppo_episodes}")
     print(f"SAC ??????        : {args.sac_episodes}")
+    print(f"RL agent             : {args.rl_agent}")
+    print(f"Include latent state : {args.include_latent_state}")
     print(f"??? VAE-only ???   : {args.formal_vae_only}")
     print(f"??? formal RL ???  : {args.formal_rl}")
     print(f"??? fast profile ? : {args.fast_profile}")
     if args.optuna_best_trial:
         print(f"Optuna ??????     : {Path(args.optuna_best_trial).resolve()}")
+    if args.reuse_rl_assets_from:
+        print(f"Reuse RL assets      : {Path(args.reuse_rl_assets_from).resolve()}")
+
+    if args.formal_rl and args.reuse_rl_assets_from:
+        if args.prepare_rl_assets_only:
+            raise ValueError("--prepare-rl-assets-only cannot be combined with --reuse-rl-assets-from.")
+        final_summary = run_formal_rl_with_reused_assets(args, output_dir, device)
+        print_section("RL experiment complete")
+        print(f"Output directory      : {output_dir.resolve()}")
+        print(f"State dimension       : {final_summary['state_definition']['state_dim']}")
+        print("- ppo/sac_training_summary.json (selected agent only)")
+        print("- ppo/sac_evaluation_summary.json (selected agent only)")
+        print("- tensorboard/ and policy_comparison.json")
+        return
 
     builder, clean_samples, arrays, clean_summary = build_dataset(args, output_dir)
 
@@ -2433,7 +2695,10 @@ def main() -> None:
         print("- train_split|val_split|test_split/vae_reconstruction.png")
         print("- zero/random/ppo/sac_evaluation_summary.json")
         print("- policy_comparison.json / final_summary.json")
-        print(f"RL ????????      : {final_summary['state_definition']['state_dim']}")
+        if args.prepare_rl_assets_only:
+            print("- rl_assets_ready.json / expert_bank.npz")
+        else:
+            print(f"RL ????????      : {final_summary['state_definition']['state_dim']}")
         return
 
     selected_metric_names = get_selected_supervision_metric_names(

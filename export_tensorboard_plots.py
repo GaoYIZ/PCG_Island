@@ -71,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Maximum individual curve PNGs to save per agent; 0 means save all.",
     )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Discover and export every experiment run below --run-dir.",
+    )
     return parser.parse_args()
 
 
@@ -419,11 +424,9 @@ def write_manifest(
     return path
 
 
-def main() -> int:
-    args = parse_args()
-    run_dir = args.run_dir.resolve()
+def export_run(args: argparse.Namespace, run_dir: Path, output_dir: Path | None = None) -> dict[str, object]:
     tensorboard_dir = (args.tensorboard_dir or run_dir / "tensorboard").resolve()
-    output_dir = (args.output_dir or run_dir / "tensorboard_plots").resolve()
+    output_dir = (output_dir or run_dir / "tensorboard_plots").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     points = load_scalars(args, run_dir, tensorboard_dir)
@@ -446,13 +449,53 @@ def main() -> int:
     )
     manifest_path = write_manifest(output_dir, run_dir, tensorboard_dir, points, overview_paths, individual_paths, csv_path)
 
-    print(f"Exported {len(points)} scalar points")
+    print(f"Exported {len(points)} scalar points from {run_dir}")
     print(f"CSV: {csv_path}")
     print(f"Overview PNGs: {len(overview_paths)}")
     for path in overview_paths:
         print(f"  {path}")
     print(f"Individual curve PNGs: {len(individual_paths)}")
     print(f"Manifest: {manifest_path}")
+    return {
+        "run_dir": str(run_dir),
+        "manifest": str(manifest_path),
+        "scalar_count": len(points),
+        "overview_pngs": [str(path) for path in overview_paths],
+    }
+
+
+def discover_run_dirs(root: Path) -> list[Path]:
+    runs = set()
+    if (root / "tensorboard").is_dir():
+        runs.add(root)
+    for tensorboard_dir in root.rglob("tensorboard"):
+        if tensorboard_dir.is_dir():
+            runs.add(tensorboard_dir.parent)
+    return sorted(runs)
+
+
+def main() -> int:
+    args = parse_args()
+    run_dir = args.run_dir.resolve()
+    if not args.recursive:
+        output_dir = None if args.output_dir is None else args.output_dir.resolve()
+        export_run(args, run_dir, output_dir)
+        return 0
+
+    run_dirs = discover_run_dirs(run_dir)
+    if not run_dirs:
+        raise FileNotFoundError(f"No TensorBoard run directories found below {run_dir}")
+    suite_results = []
+    for child_run_dir in run_dirs:
+        try:
+            suite_results.append(export_run(args, child_run_dir))
+        except FileNotFoundError as exc:
+            print(f"[Skip] {exc}")
+    suite_manifest_dir = (args.output_dir or run_dir / "tensorboard_plots").resolve()
+    suite_manifest_dir.mkdir(parents=True, exist_ok=True)
+    suite_manifest = suite_manifest_dir / "suite_manifest.json"
+    suite_manifest.write_text(json.dumps(suite_results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Suite manifest: {suite_manifest}")
     return 0
 
 

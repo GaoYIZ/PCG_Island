@@ -18,8 +18,9 @@ from dataset_pipeline import IslandDatasetBuilder
 from feature_processing import IslandFeatureNormalizer, ParameterSpaceNormalizer
 from map_scoring import MapScorer
 from pcg_generator import PCGIslandGenerator
-from ppo_baseline import PPOAgent
+from ppo_baseline import PPOAgent, PPONetwork
 from rl_environment import IslandGenerationEnv
+from sac_agent import SACAgent
 from structure_evaluator import StructureEvaluator
 from formal_experiment import (
     apply_fast_profile,
@@ -523,6 +524,32 @@ class IslandPipelineTests(unittest.TestCase):
         self.assertIn("total_loss", losses)
         self.assertIn("policy_loss", losses)
         self.assertIn("value_loss", losses)
+
+    def test_ppo_hidden_layer_count_is_configurable(self) -> None:
+        for hidden_layers in (1, 2, 3):
+            network = PPONetwork(
+                state_dim=18,
+                action_dim=12,
+                hidden_dim=32,
+                hidden_layers=hidden_layers,
+            )
+            actor_linear_layers = sum(isinstance(layer, torch.nn.Linear) for layer in network.actor)
+            critic_linear_layers = sum(isinstance(layer, torch.nn.Linear) for layer in network.critic)
+            self.assertEqual(actor_linear_layers, hidden_layers)
+            self.assertEqual(critic_linear_layers, hidden_layers + 1)
+
+    def test_sac_alpha_floor_and_target_entropy_scale(self) -> None:
+        agent = SACAgent(
+            state_dim=18,
+            action_dim=12,
+            min_alpha=0.03,
+            target_entropy_scale=0.8,
+        )
+        with torch.no_grad():
+            agent.log_alpha.fill_(-20.0)
+        agent._clamp_alpha()
+        self.assertGreaterEqual(float(agent.log_alpha.exp().item()), 0.03 - 1e-6)
+        self.assertAlmostEqual(agent.target_entropy, -9.6)
 
 
 if __name__ == "__main__":

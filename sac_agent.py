@@ -118,6 +118,8 @@ class SACAgent:
         gamma: float = 0.99,
         tau: float = 0.005,
         alpha: float = 0.2,
+        target_entropy_scale: float = 1.0,
+        min_alpha: float = 0.0,
         action_range: float = 1.0,
     ):
         self.state_dim = int(state_dim)
@@ -141,7 +143,9 @@ class SACAgent:
         initial_log_alpha = np.log(max(float(alpha), 1e-6))
         self.log_alpha = torch.tensor([initial_log_alpha], dtype=torch.float32, requires_grad=True)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=self.alpha_lr)
-        self.target_entropy = -float(action_dim)
+        self.target_entropy_scale = float(max(target_entropy_scale, 0.05))
+        self.target_entropy = -float(action_dim) * self.target_entropy_scale
+        self.min_alpha = float(max(min_alpha, 0.0))
         self.alpha = float(alpha)
 
     def to(self, device) -> "SACAgent":
@@ -246,9 +250,17 @@ class SACAgent:
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.alpha_optimizer.step()
+        self._clamp_alpha()
 
         self.alpha = float(self.log_alpha.exp().item())
         return alpha_loss.item()
+
+    def _clamp_alpha(self) -> None:
+        if self.min_alpha <= 0.0:
+            return
+        min_log_alpha = float(np.log(max(self.min_alpha, 1e-8)))
+        with torch.no_grad():
+            self.log_alpha.clamp_(min=min_log_alpha)
 
     @staticmethod
     def _soft_update(source: nn.Module, target: nn.Module, tau: float) -> None:
@@ -266,6 +278,8 @@ class SACAgent:
                 "alpha_optimizer": self.alpha_optimizer.state_dict(),
                 "log_alpha": self.log_alpha.detach().cpu(),
                 "alpha": float(self.alpha),
+                "min_alpha": float(self.min_alpha),
+                "target_entropy_scale": float(self.target_entropy_scale),
             },
             path,
         )
@@ -284,4 +298,10 @@ class SACAgent:
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=self.alpha_lr)
         if "alpha_optimizer" in checkpoint:
             self.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
-        self.alpha = float(checkpoint.get("alpha", self.log_alpha.exp().item()))
+        if "min_alpha" in checkpoint:
+            self.min_alpha = float(checkpoint["min_alpha"])
+        if "target_entropy_scale" in checkpoint:
+            self.target_entropy_scale = float(checkpoint["target_entropy_scale"])
+            self.target_entropy = -float(self.action_dim) * self.target_entropy_scale
+        self._clamp_alpha()
+        self.alpha = float(self.log_alpha.exp().item())

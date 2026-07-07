@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo-episodes", type=int, default=1500)
     parser.add_argument("--ppo-max-steps", type=int, default=15)
     parser.add_argument("--ppo-rollout-steps", type=int, default=1024)
+    parser.add_argument("--ppo-hidden-layers", type=int, default=2)
     parser.add_argument("--ppo-lr", type=float, default=3e-4)
     parser.add_argument("--sac-episodes", type=int, default=4000)
     parser.add_argument("--eval-islands", type=int, default=64)
@@ -80,6 +81,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sac-actor-lr", type=float, default=1e-4)
     parser.add_argument("--sac-critic-lr", type=float, default=3e-4)
     parser.add_argument("--sac-alpha-lr", type=float, default=1e-4)
+    parser.add_argument("--sac-min-alpha", type=float, default=0.0)
+    parser.add_argument("--sac-target-entropy-scale", type=float, default=1.0)
+
+    parser.add_argument("--rl-agent", choices=["ppo", "sac", "both"], default="both")
+    parser.add_argument(
+        "--include-latent-state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--reuse-rl-assets-from", type=str, default="")
+    parser.add_argument("--prepare-rl-assets-only", action="store_true")
+    parser.add_argument("--preserve-latent-dim", action="store_true")
 
     parser.add_argument("--expert-top-percent", type=float, default=0.10)
     parser.add_argument("--expert-max-samples", type=int, default=256)
@@ -189,6 +202,8 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
         str(args.ppo_max_steps),
         "--ppo-rollout-steps",
         str(args.ppo_rollout_steps),
+        "--ppo-hidden-layers",
+        str(args.ppo_hidden_layers),
         "--ppo-lr",
         str(args.ppo_lr),
         "--sac-episodes",
@@ -231,6 +246,12 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
         str(args.sac_critic_lr),
         "--sac-alpha-lr",
         str(args.sac_alpha_lr),
+        "--sac-min-alpha",
+        str(args.sac_min_alpha),
+        "--sac-target-entropy-scale",
+        str(args.sac_target_entropy_scale),
+        "--rl-agent",
+        args.rl_agent,
         "--expert-top-percent",
         str(args.expert_top_percent),
         "--expert-max-samples",
@@ -248,6 +269,13 @@ def build_rl_command(args: argparse.Namespace, workspace: Path, best_trial_path:
     ]
     command.append("--restore-best-policy" if args.restore_best_policy else "--no-restore-best-policy")
     command.append("--tensorboard" if args.tensorboard else "--no-tensorboard")
+    command.append("--include-latent-state" if args.include_latent_state else "--no-include-latent-state")
+    if args.reuse_rl_assets_from:
+        command.extend(["--reuse-rl-assets-from", args.reuse_rl_assets_from])
+    if args.prepare_rl_assets_only:
+        command.append("--prepare-rl-assets-only")
+    if args.preserve_latent_dim:
+        command.append("--preserve-latent-dim")
     if args.tensorboard_dir:
         command.extend(["--tensorboard-dir", args.tensorboard_dir])
     if args.drop_connectivity_supervision:

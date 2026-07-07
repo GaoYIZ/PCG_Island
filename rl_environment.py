@@ -29,6 +29,7 @@ class IslandGenerationEnv(gym.Env):
         feature_normalizer: Optional[IslandFeatureNormalizer] = None,
         scorer: Optional[MapScorer] = None,
         include_latent: bool = True,
+        latent_novelty: bool = True,
         action_step_scale: float = 0.08,
         sampling_profile: str = "island",
         novelty_reference_vectors: Optional[Sequence[Sequence[float]]] = None,
@@ -51,6 +52,8 @@ class IslandGenerationEnv(gym.Env):
         self.max_steps = max_steps
         self.vae_model = vae_model
         self.include_latent = include_latent and vae_model is not None
+        self.latent_novelty = latent_novelty and vae_model is not None
+        self.encode_latent = self.include_latent or self.latent_novelty
 
         self.generator = PCGIslandGenerator(map_size=map_size)
         self.evaluator = StructureEvaluator(map_size=map_size)
@@ -266,14 +269,14 @@ class IslandGenerationEnv(gym.Env):
         )
 
     def _encode_latent(self, heightmap: np.ndarray) -> Optional[np.ndarray]:
-        if not self.include_latent or self.vae_model is None:
+        if not self.encode_latent or self.vae_model is None:
             return None
         return self.vae_model.encode_heightmap(heightmap, deterministic=True)
 
     def _get_novelty_vector(self) -> Optional[np.ndarray]:
         if self.current_metrics is None:
             return None
-        if self.include_latent and self.current_latent is not None:
+        if self.current_latent is not None:
             return self.feature_normalizer.transform_latent(self.current_latent)
         return self.feature_normalizer.transform_metrics(self.current_metrics)
 

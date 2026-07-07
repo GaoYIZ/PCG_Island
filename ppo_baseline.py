@@ -16,26 +16,34 @@ from torch.distributions import Normal
 class PPONetwork(nn.Module):
     """Actor-critic network used by PPO."""
 
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, action_range: float = 1.0):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        hidden_layers: int = 2,
+        action_range: float = 1.0,
+    ):
         super().__init__()
         self.action_range = float(action_range)
+        self.hidden_layers = int(max(1, hidden_layers))
 
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
+        actor_layers = []
+        actor_input_dim = state_dim
+        for _ in range(self.hidden_layers):
+            actor_layers.extend([nn.Linear(actor_input_dim, hidden_dim), nn.ReLU()])
+            actor_input_dim = hidden_dim
+        self.actor = nn.Sequential(*actor_layers)
         self.actor_mean = nn.Linear(hidden_dim, action_dim)
         self.actor_logstd = nn.Linear(hidden_dim, action_dim)
 
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        critic_layers = []
+        critic_input_dim = state_dim
+        for _ in range(self.hidden_layers):
+            critic_layers.extend([nn.Linear(critic_input_dim, hidden_dim), nn.ReLU()])
+            critic_input_dim = hidden_dim
+        critic_layers.append(nn.Linear(hidden_dim, 1))
+        self.critic = nn.Sequential(*critic_layers)
 
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         actor_features = self.actor(state)
@@ -81,6 +89,7 @@ class PPOAgent:
         state_dim: int,
         action_dim: int,
         hidden_dim: int = 256,
+        hidden_layers: int = 2,
         learning_rate: float = 3e-4,
         gamma: float = 0.99,
         lam: float = 0.95,
@@ -94,7 +103,7 @@ class PPOAgent:
         self.clip_epsilon = clip_epsilon
         self.epoch = epoch
         self.batch_size = batch_size
-        self.network = PPONetwork(state_dim, action_dim, hidden_dim, action_range)
+        self.network = PPONetwork(state_dim, action_dim, hidden_dim, hidden_layers, action_range)
         self.optimizer = optim.Adam(self.network.parameters(), lr=learning_rate)
 
     def to(self, device: str | torch.device):
