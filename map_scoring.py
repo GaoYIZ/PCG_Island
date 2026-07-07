@@ -35,8 +35,8 @@ class MapScorer:
     """
     Single source of truth for terrain quality.
 
-    The score follows a compact reward definition with a small balance term
-    that discourages optimizing one metric while collapsing another.
+    The score follows a compact reward definition:
+    R = sum(w_i * R_i) + lambda * R_novelty.
     """
 
     def __init__(
@@ -46,14 +46,12 @@ class MapScorer:
         connectivity_alpha: float = 0.35,
         navigable_mu: float = 0.90,
         navigable_sigma: float = 0.18,
-        coast_mu: float = 3.80,
-        coast_sigma: float = 1.35,
-        variance_mu: float = 0.10,
-        variance_sigma: float = 0.055,
-        land_mu: float = 0.23,
-        land_sigma: float = 0.11,
-        slope_ratio_sigma: float = 0.20,
-        coast_steep_sigma: float = 0.24,
+        coast_mu: float = 4.50,
+        coast_sigma: float = 2.75,
+        variance_mu: float = 0.13,
+        variance_sigma: float = 0.08,
+        land_mu: float = 0.30,
+        land_sigma: float = 0.20,
     ):
         self.connectivity_alpha = float(connectivity_alpha)
         self.gaussian_targets = {
@@ -62,17 +60,13 @@ class MapScorer:
             "terrain_variance": {"mu": float(variance_mu), "sigma": float(variance_sigma)},
             "land_ratio": {"mu": float(land_mu), "sigma": float(land_sigma)},
         }
-        self.slope_ratio_sigma = float(slope_ratio_sigma)
-        self.coast_steep_sigma = float(coast_steep_sigma)
         self.total_weights = {
-            "connectivity": 0.22,
-            "path": 0.22,
+            "connectivity": 0.30,
+            "path": 0.30,
             "navigable": 0.14,
-            "coast": 0.12,
-            "slope": 0.10,
-            "coast_slope": 0.08,
-            "land": 0.07,
-            "variance": 0.03,
+            "coast": 0.10,
+            "variance": 0.10,
+            "land": 0.04,
             "novelty": 0.02,
         }
         self.novelty_scale = float(novelty_scale)
@@ -93,24 +87,13 @@ class MapScorer:
         connectivity = float(np.clip(metrics["connectivity"], 0.0, 1.0))
         return self._gaussian_score(connectivity, mu=1.0, sigma=0.25)
 
-    @staticmethod
-    def _upper_limit_score(value: float, sigma: float) -> float:
-        sigma = max(float(sigma), 1e-8)
-        score = np.exp(-((max(float(value), 0.0)) ** 2) / (sigma**2))
-        return float(np.clip(score, 0.0, 1.0))
-
     def describe(self) -> Dict[str, object]:
         return {
-            "formula": "R = 0.92 * sum(w_i * R_i) + 0.08 * balance_score",
+            "formula": "R = sum(w_i * R_i) + lambda * R_novelty",
             "connectivity": "exp(-alpha * (component_count - 1)^2), fallback uses connectivity ratio",
             "path": "continuous path_reachability",
-            "balance_score": "min(connectivity, path, navigable, coast, land, slope, coast_slope) to prevent single-objective reward hacking",
             "gaussian_targets": self.gaussian_targets,
             "connectivity_alpha": self.connectivity_alpha,
-            "slope": "exp(-(steep_slope_ratio / sigma)^2), lower is better",
-            "coast_slope": "exp(-(coast_steep_ratio / sigma)^2), lower is better",
-            "slope_ratio_sigma": self.slope_ratio_sigma,
-            "coast_steep_sigma": self.coast_steep_sigma,
             "total_weights": self.total_weights,
             "novelty_scale": self.novelty_scale,
             "novelty_k": self.novelty_k,
@@ -166,14 +149,6 @@ class MapScorer:
             metrics["land_ratio"],
             **self.gaussian_targets["land_ratio"],
         )
-        slope_score = self._upper_limit_score(
-            metrics.get("steep_slope_ratio", max(0.0, 1.0 - float(metrics["navigable_ratio"]))),
-            sigma=self.slope_ratio_sigma,
-        )
-        coast_slope_score = self._upper_limit_score(
-            metrics.get("coast_steep_ratio", metrics.get("steep_slope_ratio", 0.0)),
-            sigma=self.coast_steep_sigma,
-        )
         novelty_score = self.compute_novelty_score(feature_vector, history_vectors)
 
         total_score = (
@@ -181,38 +156,20 @@ class MapScorer:
             + self.total_weights["path"] * path_score
             + self.total_weights["navigable"] * navigable_score
             + self.total_weights["coast"] * coast_score
-            + self.total_weights["slope"] * slope_score
-            + self.total_weights["coast_slope"] * coast_slope_score
             + self.total_weights["variance"] * variance_score
             + self.total_weights["land"] * land_score
             + self.total_weights["novelty"] * novelty_score
         )
-        balance_score = float(
-            min(
-                connectivity_score,
-                path_score,
-                navigable_score,
-                coast_score,
-                land_score,
-                slope_score,
-                coast_slope_score,
-            )
-        )
-        total_score = 0.92 * total_score + 0.08 * balance_score
 
         structure_score = (
             self.total_weights["connectivity"] * connectivity_score
             + self.total_weights["navigable"] * navigable_score
             + self.total_weights["coast"] * coast_score
-            + self.total_weights["slope"] * slope_score
-            + self.total_weights["coast_slope"] * coast_slope_score
             + self.total_weights["variance"] * variance_score
         ) / (
             self.total_weights["connectivity"]
             + self.total_weights["navigable"]
             + self.total_weights["coast"]
-            + self.total_weights["slope"]
-            + self.total_weights["coast_slope"]
             + self.total_weights["variance"]
         )
 
@@ -221,9 +178,6 @@ class MapScorer:
             "navigable_score": navigable_score,
             "coast_score": coast_score,
             "variance_score": variance_score,
-            "slope_score": slope_score,
-            "coast_slope_score": coast_slope_score,
-            "balance_score": balance_score,
         }
         return ScoreBreakdown(
             total_score=float(np.clip(total_score, 0.0, 1.0)),

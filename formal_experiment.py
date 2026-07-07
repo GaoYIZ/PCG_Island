@@ -17,7 +17,7 @@ import argparse
 import csv
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -53,9 +53,6 @@ STRUCTURE_SUPERVISION_WEIGHTS: Dict[str, float] = {
     "terrain_variance": 1.0,
     "path_reachability": 2.2,
     "land_ratio": 0.8,
-    "mean_slope": 1.0,
-    "steep_slope_ratio": 1.5,
-    "coast_steep_ratio": 1.6,
     "component_count": 1.8,
 }
 
@@ -131,14 +128,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sac-actor-lr", type=float, default=3e-4, help="Actor learning rate for SAC")
     parser.add_argument("--sac-critic-lr", type=float, default=1e-3, help="Critic learning rate for SAC")
     parser.add_argument("--sac-alpha-lr", type=float, default=3e-4, help="Entropy-temperature learning rate for SAC")
-    parser.add_argument("--sac-min-alpha", type=float, default=0.0, help="Lower bound for SAC entropy temperature; 0 disables clamping")
-    parser.add_argument(
-        "--sac-target-entropy-scale",
-        type=float,
-        default=1.0,
-        help="Scale SAC target entropy (-action_dim * scale); lower values slow excessive entropy-temperature collapse.",
-    )
-    parser.add_argument("--sac-updates-per-step", type=int, default=1, help="Number of SAC gradient updates per environment step after warmup")
     parser.add_argument("--sac-learning-starts", type=int, default=512, help="Number of environment steps collected before SAC updates start")
     parser.add_argument("--sac-print-interval", type=int, default=5, help="Episode interval for SAC progress printing")
     parser.add_argument("--expert-top-percent", type=float, default=0.10, help="Top fraction of cleaned samples saved as expert references")
@@ -150,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-best-scale", type=float, default=2.0, help="Extra reward for improving beyond the best score seen in the current episode")
     parser.add_argument("--reward-step-penalty", type=float, default=0.01, help="Small per-step penalty to encourage faster convergence")
     parser.add_argument("--reward-success-bonus", type=float, default=1.0, help="Bonus added when the success threshold is reached")
-    parser.add_argument("--reward-success-threshold", type=float, default=0.62, help="Episode ends successfully once the total score reaches this threshold enough times")
+    parser.add_argument("--reward-success-threshold", type=float, default=0.72, help="Episode ends successfully once the total score reaches this threshold enough times")
     parser.add_argument("--reward-success-gain-threshold", type=float, default=0.03, help="Minimum total-score gain required before success bonus/termination")
     parser.add_argument("--reward-failure-threshold", type=float, default=0.10, help="Episode fails early if the total score falls below this threshold")
     parser.add_argument("--reward-success-streak", type=int, default=3, help="Number of consecutive successful steps required for early success termination")
@@ -175,17 +164,6 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="TensorBoard output directory; defaults to <output-dir>/tensorboard.",
     )
-    parser.add_argument(
-        "--unity-export-top-k",
-        type=int,
-        default=2,
-        help="Export the top-K PPO/SAC evaluation islands as Unity-ready raw/png/json packages; 0 disables.",
-    )
-    parser.add_argument("--unity-terrain-width", type=float, default=512.0, help="Unity terrain width for exported islands")
-    parser.add_argument("--unity-terrain-length", type=float, default=512.0, help="Unity terrain length for exported islands")
-    parser.add_argument("--unity-terrain-height", type=float, default=45.0, help="Unity terrain height scale for exported islands")
-    parser.add_argument("--unity-sea-level", type=float, default=0.30, help="Unity water level for exported islands")
-    parser.add_argument("--unity-target-resolution", type=int, default=257, help="Unity Terrain heightmap resolution")
     parser.add_argument("--eval-islands", type=int, default=12, help="Number of final evaluation islands")
     parser.add_argument("--skip-rl", action="store_true", help="Stop after VAE evaluation and skip RL/baselines")
     parser.add_argument(
@@ -626,12 +604,8 @@ class LiveTrainingDashboard:
                     "score_gain": series.get("score_gain", []),
                     "path_score": series.get("path_score", []),
                     "connectivity_score": series.get("connectivity_score", []),
-                    "coast_score": series.get("coast_score", []),
-                    "land_score": series.get("land_score", []),
-                    "coast_slope_score": series.get("coast_slope_score", []),
-                    "balance_score": series.get("balance_score", []),
                 },
-                "Balanced quality components",
+                "Gain / path / connectivity",
                 "score",
             )
             self.figure.suptitle(self.title)
@@ -666,12 +640,8 @@ class LiveTrainingDashboard:
                 "score_gain": series.get("score_gain", []),
                 "path_score": series.get("path_score", []),
                 "connectivity_score": series.get("connectivity_score", []),
-                "coast_score": series.get("coast_score", []),
-                "land_score": series.get("land_score", []),
-                "coast_slope_score": series.get("coast_slope_score", []),
-                "balance_score": series.get("balance_score", []),
             },
-            "Balanced quality components",
+            "Gain / path / connectivity",
             "score",
         )
         figure.suptitle(self.title)
@@ -892,217 +862,6 @@ def plot_ranked_maps(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
-
-
-def make_json_safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): make_json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [make_json_safe(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return make_json_safe(value.tolist())
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    if isinstance(value, np.bool_):
-        return bool(value)
-    if isinstance(value, Path):
-        return str(value)
-    return value
-
-
-def normalize_theta_for_export(params: Dict[str, Any]) -> Dict[str, Any]:
-    theta = make_json_safe(dict(params))
-    for key in ("seed", "N_octaves", "voronoi_cells"):
-        if key in theta:
-            theta[key] = int(round(float(theta[key])))
-    return theta
-
-
-def save_unity_preview(heightmap: np.ndarray, path: Path, sea_level: float) -> None:
-    fig, axis = plt.subplots(figsize=(7.2, 6.4), dpi=150)
-    image = axis.imshow(heightmap, cmap="terrain", vmin=0.0, vmax=1.0)
-    axis.contour(heightmap, levels=[sea_level], colors=["#0f4c81"], linewidths=1.0)
-    axis.set_title("RL-selected PCG Island")
-    axis.set_axis_off()
-    fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04, label="height")
-    fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
-
-
-def save_unity_3d_preview(heightmap: np.ndarray, path: Path, sea_level: float) -> None:
-    step = max(1, heightmap.shape[0] // 96)
-    sampled = heightmap[::step, ::step]
-    y = np.linspace(0.0, 1.0, sampled.shape[0])
-    x = np.linspace(0.0, 1.0, sampled.shape[1])
-    grid_x, grid_y = np.meshgrid(x, y)
-
-    fig = plt.figure(figsize=(9.6, 7.2), dpi=150)
-    axis = fig.add_subplot(111, projection="3d")
-    axis.plot_surface(grid_x, grid_y, sampled, cmap="terrain", linewidth=0, antialiased=True, alpha=0.96)
-    axis.plot_surface(
-        grid_x,
-        grid_y,
-        np.full_like(sampled, sea_level),
-        color="#1f9bd1",
-        linewidth=0,
-        antialiased=False,
-        alpha=0.18,
-    )
-    axis.set_title("RL-selected PCG Island 3D Preview")
-    axis.set_xlabel("x")
-    axis.set_ylabel("y")
-    axis.set_zlabel("height")
-    axis.set_zlim(0.0, 1.0)
-    axis.view_init(elev=42, azim=-126)
-    fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
-
-
-def save_unity_heightmap_assets(
-    heightmap: np.ndarray,
-    export_dir: Path,
-    sea_level: float,
-) -> Dict[str, Path]:
-    export_dir.mkdir(parents=True, exist_ok=True)
-    heightmap = np.asarray(heightmap, dtype=np.float32)
-
-    paths = {
-        "npy": export_dir / "heightmap.npy",
-        "raw": export_dir / "heightmap.raw",
-        "png": export_dir / "heightmap.png",
-        "preview": export_dir / "heightmap_preview.png",
-        "plot3d": export_dir / "heightmap_3d.png",
-    }
-    np.save(paths["npy"], heightmap)
-    np.rint(np.clip(heightmap, 0.0, 1.0) * 65535.0).astype("<u2").tofile(paths["raw"])
-    plt.imsave(paths["png"], heightmap, cmap="gray", vmin=0.0, vmax=1.0)
-    save_unity_preview(heightmap, paths["preview"], sea_level)
-    save_unity_3d_preview(heightmap, paths["plot3d"], sea_level)
-    return paths
-
-
-def write_unity_import_readme(export_dir: Path, config_path: Path) -> Path:
-    readme_path = export_dir / "README_unity_import.txt"
-    readme_path.write_text(
-        "\n".join(
-            [
-                "Unity import command for this RL-selected island:",
-                "",
-                "cd E:\\IslandTest_remote_work",
-                (
-                    "python import_rl_export_to_unity.py "
-                    f"--config \"{config_path}\" "
-                    "--open-unity"
-                ),
-                "",
-                "This folder also contains theta.json, heightmap.raw, heightmap.png, "
-                "heightmap_preview.png, and heightmap_3d.png.",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    return readme_path
-
-
-def export_top_unity_islands(
-    name: str,
-    records: List[Dict[str, object]],
-    heightmaps: Sequence[np.ndarray],
-    output_dir: Path,
-    args: Optional[argparse.Namespace],
-) -> List[Dict[str, object]]:
-    if args is None or name.lower() not in {"ppo", "sac"}:
-        return []
-
-    top_k = max(0, int(getattr(args, "unity_export_top_k", 0)))
-    if top_k == 0 or len(records) == 0:
-        return []
-
-    sea_level = float(getattr(args, "unity_sea_level", COAST_THRESHOLD))
-    ranked_indices = sorted(
-        range(len(records)),
-        key=lambda idx: float(records[idx]["final_score"]["total_score"]),
-        reverse=True,
-    )[: min(top_k, len(records))]
-
-    exports: List[Dict[str, object]] = []
-    root = output_dir / f"{name.lower()}_unity_exports"
-    for rank, record_index in enumerate(ranked_indices, start=1):
-        record = records[record_index]
-        heightmap = np.asarray(heightmaps[record_index], dtype=np.float32)
-        total_score = float(record["final_score"]["total_score"])
-        export_dir = root / f"top_{rank:02d}_score_{total_score:.4f}_eval_{int(record['index']):03d}"
-        paths = save_unity_heightmap_assets(heightmap, export_dir, sea_level)
-
-        theta = normalize_theta_for_export(record.get("final_params", {}))
-        island_id = f"{name}_Top_{rank:02d}_Score_{total_score:.4f}"
-        config_path = export_dir / "island_config.json"
-        config = {
-            "format_version": "pcg_island_unity_v1",
-            "island_id": island_id,
-            "source": f"formal_experiment:{name}:eval_index:{record['index']}",
-            "heightmap_raw_path": paths["raw"].name,
-            "heightmap_png_path": paths["png"].name,
-            "height_format": "R16_LE_NORMALIZED",
-            "source_width": int(heightmap.shape[1]),
-            "source_height": int(heightmap.shape[0]),
-            "target_heightmap_resolution": int(getattr(args, "unity_target_resolution", 257)),
-            "terrain_width": float(getattr(args, "unity_terrain_width", 512.0)),
-            "terrain_length": float(getattr(args, "unity_terrain_length", 512.0)),
-            "terrain_height": float(getattr(args, "unity_terrain_height", 80.0)),
-            "sea_level": sea_level,
-            "flip_y": True,
-            "theta": theta,
-        }
-        save_json(config, config_path)
-        save_json(theta, export_dir / "theta.json")
-
-        metadata = {
-            "agent": name,
-            "rank": rank,
-            "eval_index": int(record["index"]),
-            "reward": float(record["reward"]),
-            "done_reason": record.get("done_reason"),
-            "initial_params": record.get("initial_params", {}),
-            "final_params": theta,
-            "initial_metrics": record.get("initial_metrics", {}),
-            "final_metrics": record.get("final_metrics", {}),
-            "initial_score": record.get("initial_score", {}),
-            "final_score": record.get("final_score", {}),
-            "score_gain": record.get("score_gain", {}),
-            "heightmap_stats": {
-                "min": float(np.min(heightmap)),
-                "max": float(np.max(heightmap)),
-                "mean": float(np.mean(heightmap)),
-                "std": float(np.std(heightmap)),
-            },
-            "outputs": {key: str(path.resolve()) for key, path in paths.items()},
-            "unity_config": str(config_path.resolve()),
-        }
-        save_json(make_json_safe(metadata), export_dir / "metadata.json")
-        readme_path = write_unity_import_readme(export_dir, config_path.resolve())
-
-        export_info = {
-            "rank": rank,
-            "eval_index": int(record["index"]),
-            "total_score": total_score,
-            "export_dir": str(export_dir.resolve()),
-            "unity_config": str(config_path.resolve()),
-            "theta_json": str((export_dir / "theta.json").resolve()),
-            "heightmap_raw": str(paths["raw"].resolve()),
-            "heightmap_png": str(paths["png"].resolve()),
-            "heightmap_preview": str(paths["preview"].resolve()),
-            "heightmap_3d": str(paths["plot3d"].resolve()),
-            "readme": str(readme_path.resolve()),
-        }
-        record["unity_export"] = export_info
-        exports.append(export_info)
-
-    return exports
 
 
 def reconstruct_heightmaps(
@@ -1375,12 +1134,6 @@ def _append_training_dashboard_point(
     series["connectivity_score"].append(
         float(final_score["connectivity_score"]) if "connectivity_score" in final_score else None
     )
-    series["coast_score"].append(float(final_score["coast_score"]) if "coast_score" in final_score else None)
-    series["land_score"].append(float(final_score["land_score"]) if "land_score" in final_score else None)
-    series["coast_slope_score"].append(
-        float(final_score["coast_slope_score"]) if "coast_slope_score" in final_score else None
-    )
-    series["balance_score"].append(float(final_score["balance_score"]) if "balance_score" in final_score else None)
 
 
 def train_formal_vae(
@@ -1936,16 +1689,16 @@ def run_formal_rl_experiment(
     env_factory = build_env_factory(args, vae, feature_normalizer, reference_bank)
     zero_policy = ZeroPolicy(action_dim=len(builder.param_normalizer.param_names))
     random_policy = RandomPolicy(action_dim=len(builder.param_normalizer.param_names), seed=args.seed + 3000)
-    zero_summary = evaluate_agent_with_gain("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000, args)
-    random_summary = evaluate_agent_with_gain("Random", random_policy, env_factory, output_dir, args.eval_islands, args.seed + 1500, args)
+    zero_summary = evaluate_agent_with_gain("Zero", zero_policy, env_factory, output_dir, args.eval_islands, args.seed + 1000)
+    random_summary = evaluate_agent_with_gain("Random", random_policy, env_factory, output_dir, args.eval_islands, args.seed + 1500)
 
     ppo_agent, _, _ = train_ppo(args, env_factory, output_dir, device)
-    ppo_summary = evaluate_agent_with_gain("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000, args)
+    ppo_summary = evaluate_agent_with_gain("PPO", ppo_agent, env_factory, output_dir, args.eval_islands, args.seed + 2000)
 
     sac_summary = None
     if args.sac_episodes > 0:
         sac_agent, _ = train_sac_with_logging(args, env_factory, output_dir, device)
-        sac_summary = evaluate_agent_with_gain("SAC", sac_agent, env_factory, output_dir, args.eval_islands, args.seed + 4000, args)
+        sac_summary = evaluate_agent_with_gain("SAC", sac_agent, env_factory, output_dir, args.eval_islands, args.seed + 4000)
 
     policy_summaries = {
         "Zero": zero_summary,
@@ -1983,15 +1736,11 @@ def run_formal_rl_experiment(
             "sac_actor_lr": float(args.sac_actor_lr),
             "sac_critic_lr": float(args.sac_critic_lr),
             "sac_alpha_lr": float(args.sac_alpha_lr),
-            "sac_min_alpha": float(args.sac_min_alpha),
-            "sac_target_entropy_scale": float(args.sac_target_entropy_scale),
-            "sac_updates_per_step": int(args.sac_updates_per_step),
             "rl_update_batch_size": int(resolve_rl_update_batch_size(args)),
             "rl_action_step_scale": float(args.rl_action_step_scale),
             "restore_best_policy": bool(args.restore_best_policy),
             "rl_best_window": int(args.rl_best_window),
             "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),
-            "unity_export_top_k": int(args.unity_export_top_k),
         },
         "policy_comparison": compare_policy_summaries_with_gain(policy_summaries),
         "zero_summary": zero_summary,
@@ -2043,10 +1792,6 @@ def train_ppo(
         "score_gain": [],
         "path_score": [],
         "connectivity_score": [],
-        "coast_score": [],
-        "land_score": [],
-        "coast_slope_score": [],
-        "balance_score": [],
     }
     rollout_memory = []
     rollout_target_steps = max(1, int(args.ppo_rollout_steps))
@@ -2174,8 +1919,6 @@ def train_sac_with_logging(
         actor_learning_rate=args.sac_actor_lr,
         critic_learning_rate=args.sac_critic_lr,
         alpha_learning_rate=args.sac_alpha_lr,
-        target_entropy_scale=args.sac_target_entropy_scale,
-        min_alpha=args.sac_min_alpha,
     ).to(device)
     replay_buffer = ReplayBuffer(capacity=100_000)
 
@@ -2188,10 +1931,6 @@ def train_sac_with_logging(
         "score_gain": [],
         "path_score": [],
         "connectivity_score": [],
-        "coast_score": [],
-        "land_score": [],
-        "coast_slope_score": [],
-        "balance_score": [],
     }
     best_checkpoint = {
         "episode": 0,
@@ -2231,10 +1970,9 @@ def train_sac_with_logging(
             replay_buffer.push(state, action, reward, next_state, done)
             total_env_steps += 1
             if total_env_steps >= args.sac_learning_starts and len(replay_buffer) >= max(256, rl_update_batch_size * 4):
-                for _ in range(max(1, int(args.sac_updates_per_step))):
-                    losses = agent.update(replay_buffer, batch_size=rl_update_batch_size)
-                    if losses is not None:
-                        last_losses = {key: float(value) for key, value in losses.items()}
+                losses = agent.update(replay_buffer, batch_size=rl_update_batch_size)
+                if losses is not None:
+                    last_losses = {key: float(value) for key, value in losses.items()}
 
             episode_reward += reward
             state = next_state
@@ -2363,9 +2101,6 @@ def train_sac_with_logging(
             "actor_lr": float(args.sac_actor_lr),
             "critic_lr": float(args.sac_critic_lr),
             "alpha_lr": float(args.sac_alpha_lr),
-            "min_alpha": float(args.sac_min_alpha),
-            "target_entropy_scale": float(args.sac_target_entropy_scale),
-            "updates_per_step": int(args.sac_updates_per_step),
             "best_checkpoint": best_checkpoint,
             "selected_checkpoint": selected_checkpoint,
             "tensorboard_dir": str(resolve_tensorboard_dir(args, output_dir)),
@@ -2407,7 +2142,6 @@ def evaluate_agent(
     output_dir: Path,
     num_islands: int,
     seed_offset: int,
-    args: Optional[argparse.Namespace] = None,
 ) -> Dict[str, object]:
     print_section(f"第六阶段：{name} 最终评估")
     initial_metrics_list: List[Dict[str, float]] = []
@@ -2472,7 +2206,7 @@ def evaluate_agent(
     print("\n评分均值:")
     print_metric_dict(summary["评分均值"])
 
-    total_scores = [record["final_score"]["total_score"] for record in records]
+    total_scores = [record["score"]["total_score"] for record in records]
     plot_dataset_samples(np.asarray(heightmaps), output_dir / f"{name.lower()}_generated_islands.png", num_samples=9)
     plot_ranked_maps(
         heightmaps,
@@ -2481,12 +2215,8 @@ def evaluate_agent(
         title_prefix=f"{name} 评分极值样本",
     )
 
-    unity_exports = export_top_unity_islands(name, records, heightmaps, output_dir, args)
-    if unity_exports:
-        summary["unity_exports"] = unity_exports
-
     save_json(summary, output_dir / f"{name.lower()}_evaluation_summary.json")
-    save_json({"records": records, "unity_exports": unity_exports}, output_dir / f"{name.lower()}_evaluation_details.json")
+    save_json({"records": records}, output_dir / f"{name.lower()}_evaluation_details.json")
     return summary
 
 
@@ -2497,7 +2227,6 @@ def evaluate_agent_with_gain(
     output_dir: Path,
     num_islands: int,
     seed_offset: int,
-    args: Optional[argparse.Namespace] = None,
 ) -> Dict[str, object]:
     print_section(f"{name} 最终评估（含提升量）")
     initial_metrics_list: List[Dict[str, float]] = []
@@ -2526,12 +2255,6 @@ def evaluate_agent_with_gain(
         initial_score = {key: float(value) for key, value in reset_info["score"].items()}
         final_score = {key: float(value) for key, value in info["score"].items()}
         score_gain = {key: float(final_score[key] - initial_score[key]) for key in final_score.keys()}
-        initial_params = normalize_theta_for_export(reset_info.get("params", {}))
-        final_params = normalize_theta_for_export(info.get("params", {}))
-        final_heightmap = info.get("heightmap", env.current_heightmap)
-        if final_heightmap is None:
-            final_heightmap = np.zeros((env.map_size, env.map_size), dtype=np.float32)
-        final_heightmap = np.asarray(final_heightmap, dtype=np.float32)
 
         rewards.append(float(episode_reward))
         initial_metrics_list.append(initial_metrics)
@@ -2539,15 +2262,12 @@ def evaluate_agent_with_gain(
         initial_score_list.append(initial_score)
         final_score_list.append(final_score)
         score_gain_list.append(score_gain)
-        heightmaps.append(final_heightmap)
+        heightmaps.append(info["heightmap"])
         records.append(
             {
                 "index": index + 1,
                 "reward": float(episode_reward),
                 "done_reason": info.get("done_reason"),
-                "episode_steps": int(env.steps),
-                "initial_params": initial_params,
-                "final_params": final_params,
                 "initial_metrics": initial_metrics,
                 "final_metrics": final_metrics,
                 "initial_score": initial_score,
@@ -2597,12 +2317,8 @@ def evaluate_agent_with_gain(
         title_prefix=f"{name} 最终评分样本",
     )
 
-    unity_exports = export_top_unity_islands(name, records, heightmaps, output_dir, args)
-    if unity_exports:
-        summary["unity_exports"] = unity_exports
-
     save_json(summary, output_dir / f"{name.lower()}_evaluation_summary.json")
-    save_json({"records": records, "unity_exports": unity_exports}, output_dir / f"{name.lower()}_evaluation_details.json")
+    save_json({"records": records}, output_dir / f"{name.lower()}_evaluation_details.json")
     return summary
 
 
@@ -2615,16 +2331,6 @@ def compare_policy_summaries_with_gain(policy_summaries: Dict[str, Dict[str, obj
             "structure_score_gain": float(summary["score_gain_mean"]["structure_score"]),
             "path_score_gain": float(summary["score_gain_mean"]["path_score"]),
             "land_score_gain": float(summary["score_gain_mean"]["land_score"]),
-            "navigable_score_gain": float(summary["score_gain_mean"].get("navigable_score", 0.0)),
-            "coast_score_gain": float(summary["score_gain_mean"].get("coast_score", 0.0)),
-            "variance_score_gain": float(summary["score_gain_mean"].get("variance_score", 0.0)),
-            "slope_score_gain": float(summary["score_gain_mean"].get("slope_score", 0.0)),
-            "coast_slope_score_gain": float(summary["score_gain_mean"].get("coast_slope_score", 0.0)),
-            "balance_score_gain": float(summary["score_gain_mean"].get("balance_score", 0.0)),
-            "final_coast_complexity": float(summary["final_metric_mean"].get("coast_complexity", 0.0)),
-            "final_land_ratio": float(summary["final_metric_mean"].get("land_ratio", 0.0)),
-            "final_steep_slope_ratio": float(summary["final_metric_mean"].get("steep_slope_ratio", 0.0)),
-            "final_coast_steep_ratio": float(summary["final_metric_mean"].get("coast_steep_ratio", 0.0)),
             "reward_mean": float(summary["reward_summary"]["mean"]),
         }
         for policy_name, summary in policy_summaries.items()

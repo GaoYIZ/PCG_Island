@@ -17,9 +17,6 @@ DEFAULT_METRIC_BOUNDS: Dict[str, tuple[float, float]] = {
     "terrain_variance": (0.0, 0.35),
     "path_reachability": (0.0, 1.0),
     "land_ratio": (0.0, 1.0),
-    "mean_slope": (0.0, 75.0),
-    "steep_slope_ratio": (0.0, 1.0),
-    "coast_steep_ratio": (0.0, 1.0),
 }
 
 

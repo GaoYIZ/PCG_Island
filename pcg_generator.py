@@ -90,12 +90,27 @@ class PCGIslandGenerator:
         profile: str = "uniform",
     ) -> Dict[str, tuple[float, float]]:
         ranges = dict(cls._base_param_ranges(map_size))
-        if profile == "uniform":
+        if profile in {"uniform", "island"}:
+            if profile == "island":
+                sampling_ranges = cls.get_sampling_ranges(map_size, profile="island")
+                for name, (sample_low, sample_high) in sampling_ranges.items():
+                    range_low, range_high = ranges[name]
+                    ranges[name] = (min(range_low, sample_low), max(range_high, sample_high))
             return ranges
-        if profile == "island":
-            return cls.get_sampling_ranges(map_size, profile="island")
         if profile == "island_voronoi":
-            return cls.get_sampling_ranges(map_size, profile="island_voronoi")
+            sampling_ranges = cls.get_sampling_ranges(map_size, profile="island_voronoi")
+            for name, (sample_low, sample_high) in sampling_ranges.items():
+                if name in ranges:
+                    range_low, range_high = ranges[name]
+                    ranges[name] = (min(range_low, sample_low), max(range_high, sample_high))
+            ranges.update(
+                {
+                    "voronoi_weight": (0.12, 0.42),
+                    "voronoi_cells": (8.0, 24.0),
+                    "voronoi_sharpness": (0.8, 2.8),
+                }
+            )
+            return ranges
         raise ValueError(f"Unsupported parameter profile: {profile}")
 
     @classmethod
@@ -105,23 +120,23 @@ class PCGIslandGenerator:
             return base_ranges
         if profile == "island":
             return {
-                "f": (5.0, 22.0),
-                "A": (0.65, 1.18),
+                "f": (6.0, 28.0),
+                "A": (0.70, 1.40),
                 "N_octaves": (3.0, 5.0),
-                "persistence": (0.32, 0.56),
-                "lacunarity": (1.55, 2.20),
-                "warp_strength": (0.03, 0.55),
-                "warp_frequency": (1.80, 6.50),
-                "falloff_radius": (map_size * 0.34, map_size * 0.58),
-                "falloff_exponent": (1.05, 2.45),
+                "persistence": (0.35, 0.60),
+                "lacunarity": (1.60, 2.30),
+                "warp_strength": (0.05, 0.65),
+                "warp_frequency": (2.0, 7.5),
+                "falloff_radius": (map_size * 0.24, map_size * 0.48),
+                "falloff_exponent": (1.60, 3.20),
             }
         if profile == "island_voronoi":
             ranges = cls.get_sampling_ranges(map_size, profile="island")
             ranges.update(
                 {
-                    "voronoi_weight": (0.08, 0.30),
-                    "voronoi_cells": (8.0, 22.0),
-                    "voronoi_sharpness": (0.70, 2.20),
+                    "voronoi_weight": (0.12, 0.42),
+                    "voronoi_cells": (8.0, 24.0),
+                    "voronoi_sharpness": (0.8, 2.8),
                 }
             )
             return ranges
